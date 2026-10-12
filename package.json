@@ -1,6 +1,6 @@
 {
   "name": "opt2-tealbrick-rules",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "private": true,
   "description": "Rules and Approvals: a Teal Brick opt2 miniapp.",
   "license": "MIT",
