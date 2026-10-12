@@ -25,7 +25,9 @@ const json = <T>(s: unknown, fallback: T): T => {
 
 // ── caches ───────────────────────────────────────────────────────────────────
 const ruleCache = new WeakMap<Db, Rule[]>();
-const fleetCache = new WeakMap<Db, Map<string, string[]>>();
+const fleetCache = new WeakMap<Db, { idx: Map<string, string[]>; okAt: number | null }>();
+/** A Fleet copy older than this (no successful read since) is not used: team rules match nobody (A2A-9, fail safe). */
+export const FLEET_MAX_STALE_MS = 10 * 60 * 1000;
 
 export function invalidateRules(db: Db): void {
   ruleCache.delete(db);
@@ -307,6 +309,7 @@ export interface FleetTeam {
 
 export interface FleetSyncState {
   revision: number | null;
+  /** epoch ms of the last SUCCESSFUL read (errors never move it) */
   syncedAt: number | null;
   stale: boolean;
   error: string | null;
@@ -321,7 +324,11 @@ export function markFleetStale(db: Db): void {
   db.prepare("UPDATE fleet_sync SET stale = 1 WHERE id = 1").run();
 }
 
-/** Replaces the whole model in one transaction (`teams` = null keeps it and records only the sync state). */
+/**
+ * One sync outcome in one transaction. Success (`error` null): `teams` replaces the model (null = unchanged), the read
+ * time moves. Failure: `teams` = [] clears the model (revision forgotten, next read is a full one), null keeps it; the
+ * last successful read time stays.
+ */
 export function writeFleet(db: Db, teams: FleetTeam[] | null, state: { revision: number | null; error: string | null }, now = Date.now()): void {
   db.transaction(() => {
     if (teams) {
@@ -333,7 +340,9 @@ export function writeFleet(db: Db, teams: FleetTeam[] | null, state: { revision:
         for (const k of team.keys) m.run(team.id, k);
       }
     }
-    db.prepare("UPDATE fleet_sync SET revision = ?, synced_at = ?, stale = 0, error = ? WHERE id = 1").run(state.revision, now, state.error);
+    if (state.error === null) db.prepare("UPDATE fleet_sync SET revision = ?, synced_at = ?, stale = 0, error = NULL WHERE id = 1").run(state.revision, now);
+    else if (teams) db.prepare("UPDATE fleet_sync SET revision = NULL, stale = 1, error = ? WHERE id = 1").run(state.error);
+    else db.prepare("UPDATE fleet_sync SET error = ? WHERE id = 1").run(state.error);
   });
   fleetCache.delete(db);
 }
@@ -345,10 +354,20 @@ export function fleetTeams(db: Db): { id: string; name: string; people: number; 
     .map((r) => ({ id: String(r.id), name: String(r.name), people: Number(r.people), agents: Number(r.agents) }));
 }
 
-/** member key → team ids; cached until the next sync. */
-export function fleetIndex(db: Db): Map<string, string[]> {
-  const hit = fleetCache.get(db);
-  if (hit) return hit;
+/**
+ * member key → team ids; cached until the next sync. Empty when no read has succeeded within FLEET_MAX_STALE_MS, so a
+ * copy that can no longer be confirmed never decides (fail safe), whatever stopped the refresh.
+ */
+export function fleetIndex(db: Db, now = Date.now()): Map<string, string[]> {
+  let hit = fleetCache.get(db);
+  if (!hit) {
+    hit = { idx: loadFleetIndex(db), okAt: fleetState(db).syncedAt };
+    fleetCache.set(db, hit);
+  }
+  return hit.okAt != null && now - hit.okAt <= FLEET_MAX_STALE_MS ? hit.idx : new Map();
+}
+
+function loadFleetIndex(db: Db): Map<string, string[]> {
   const idx = new Map<string, string[]>();
   for (const r of db.prepare("SELECT team_id, member_key FROM fleet_members").all()) {
     const k = String(r.member_key);
@@ -356,6 +375,5 @@ export function fleetIndex(db: Db): Map<string, string[]> {
     list.push(String(r.team_id));
     idx.set(k, list);
   }
-  fleetCache.set(db, idx);
   return idx;
 }

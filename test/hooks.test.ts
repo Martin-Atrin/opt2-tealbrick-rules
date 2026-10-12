@@ -5,8 +5,9 @@ import { test } from "node:test";
 import { hookResponseProblem } from "@opt2-tealbrick/manifest";
 import type { Json } from "@opt2-tealbrick/miniapp-sdk";
 import type { RuleSpec } from "../src/engine.ts";
+import { syncFleet } from "../src/fleet.ts";
 import { FAIL_CLOSED, GATE_BUDGET_MS, HOLD_SUPPORTED, makeHooks } from "../src/hooks.ts";
-import { listDecisions, liveRules, saveRule, writeFleet } from "../src/store.ts";
+import { fleetIndex, fleetState, fleetTeams, listDecisions, liveRules, saveRule, writeFleet } from "../src/store.ts";
 import { hookCtx, hookReq, migratedDb, OWNER, spec } from "./helpers.ts";
 
 const hooks = makeHooks("rules");
@@ -112,4 +113,57 @@ test("after: results outside the narrowing are redacted and the redaction is tra
   assert.deepEqual(out, { redactions: ["/memories/2", "/memories/1"] });
   assert.equal(listDecisions(db, { callId: "cal_r", limit: 5 }).items[0]?.answered, "redact");
   assert.deepEqual(await call("rules_filter", hookReq("after", { effect: "read", output }), hookCtx(db)), {}, "no claim → no narrowing → untouched");
+});
+
+// A2A-9 (QA S3): a Fleet refusal must never leave stale team membership that a team rule could match.
+test("Fleet fail safe: refusal clears at once, transient keeps ≤ 10 min then clears, the gate never matches a stale team", async () => {
+  const T0 = 1_800_000_000_000;
+  const MIN = 60_000;
+  const teamRule = { title: "Team X may send", priority: 1, match: { effects: ["outward" as const], onBehalfOf: { teams: ["tm_x"] } }, decision: "hold" as const, reason: "Team X sends need review" };
+  const directory = { revision: 4, unchanged: false, teams: [{ id: "tm_x", name: "Team X", members: [{ kind: "person", id: "psn_1", name: "P", role: "member", handles: ["slack:U777"] }] }], people: [], agents: [] };
+  const teamsOf = (db: ReturnType<typeof migratedDb>["db"], at: number) => fleetIndex(db, at).get("handle:slack:U777") ?? [];
+  for (const refusal of [{ code: "no_grant" }, { code: "not_found" }, { code: "unlicensed" }, { code: "whatever", httpStatus: 403 }]) {
+    const { db } = migratedDb();
+    let err: Record<string, unknown> | null = null;
+    const callApp = async () => {
+      if (err) throw Object.assign(new Error("refused"), err);
+      return { status: "ok" as const, output: directory };
+    };
+    await syncFleet(db, callApp, () => T0);
+    assert.deepEqual(teamsOf(db, T0), ["tm_x"]);
+    err = refusal;
+    await syncFleet(db, callApp, () => T0 + MIN);
+    assert.deepEqual(teamsOf(db, T0 + MIN), [], `${JSON.stringify(refusal)} clears at once`);
+    assert.equal(fleetTeams(db).length, 0);
+    assert.match(String(fleetState(db).error), /^Fleet not reachable: /);
+    // and the gate no longer applies the team rule to that sender (base decision: allow)
+    saveRule(db, { spec: spec(teamRule), actor: OWNER });
+    const out = await call("rules_gate", hookReq("before", { effect: "outward", context: CLAIM }), hookCtx(db));
+    assert.deepEqual(out, { allow: true });
+    // still retrying: a later success restores the copy (full read, no stale sinceRevision)
+    err = null;
+    await syncFleet(db, async (_p: string, _o: string, input: unknown) => {
+      assert.deepEqual(input, {}, "after a clear the next read is a full one");
+      return { status: "ok" as const, output: directory };
+    }, () => Date.now());
+    assert.deepEqual(fleetIndex(db).get("handle:slack:U777"), ["tm_x"]);
+  }
+  // transient (5xx / timeout): keep while the last success is ≤ 10 min old, then clear
+  const { db } = migratedDb();
+  let err: Record<string, unknown> | null = null;
+  const callApp = async () => {
+    if (err) throw Object.assign(new Error("down"), err);
+    return { status: "ok" as const, output: directory };
+  };
+  await syncFleet(db, callApp, () => T0);
+  err = { code: "bridge_unavailable", httpStatus: 503 };
+  await syncFleet(db, callApp, () => T0 + 5 * MIN);
+  assert.deepEqual(teamsOf(db, T0 + 5 * MIN), ["tm_x"], "kept after a 5xx");
+  assert.equal(fleetState(db).syncedAt, T0, "errors never move the last successful read");
+  err = { code: "app_timeout", httpStatus: 504 };
+  await syncFleet(db, callApp, () => T0 + 9 * MIN);
+  assert.deepEqual(teamsOf(db, T0 + 9 * MIN), ["tm_x"]);
+  assert.deepEqual(teamsOf(db, T0 + 11 * MIN), [], "the gate stops using a copy older than 10 min even before the next sync");
+  await syncFleet(db, callApp, () => T0 + 11 * MIN);
+  assert.equal(fleetTeams(db).length, 0, "the sync after 10 min clears it");
 });

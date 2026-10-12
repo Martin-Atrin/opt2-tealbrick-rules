@@ -5,13 +5,40 @@
 // No Fleet (no grant, not deployed) → teams are empty, so team rules simply do not match.
 import type { Db, Json } from "@opt2-tealbrick/miniapp-sdk";
 import { normalizeHandle } from "./engine.ts";
-import { type FleetTeam, fleetState, writeFleet } from "./store.ts";
+import { FLEET_MAX_STALE_MS, type FleetTeam, fleetState, writeFleet } from "./store.ts";
 
 export const FLEET_PRODUCT = "fleet";
 export const FLEET_OP = "directory_get";
 export const REFRESH_MS = 60_000;
-/** Refusals that mean "Fleet is not there for us": the copy is cleared (teams empty), not kept. */
-const ABSENT = new Set(["not_granted", "unknown_product", "unknown_tool", "app_not_found", "grant_missing", "no_bridge"]);
+/**
+ * Refusals: Fleet is not there for us (no grant, not deployed, unlicensed, paused, ...). The copy is CLEARED at once
+ * (team rules match nobody, A2A-9 fail safe). Any 4xx except 408/429 is a refusal too; everything else (5xx, timeout,
+ * network, rate limit) is transient: the copy is kept while its last successful read is ≤ FLEET_MAX_STALE_MS old.
+ */
+const REFUSALS = new Set([
+  "no_grant",
+  "not_granted",
+  "grant_missing",
+  "grant_invalid",
+  "grant_stale",
+  "not_found",
+  "unknown_product",
+  "unknown_tool",
+  "app_not_found",
+  "unlicensed",
+  "not_licensed",
+  "forbidden",
+  "scope_denied",
+  "paused",
+  "held",
+]);
+
+export function isRefusal(e: unknown): boolean {
+  const code = isObj(e) && typeof e.code === "string" ? e.code : "";
+  if (REFUSALS.has(code)) return true;
+  const status = isObj(e) && typeof e.httpStatus === "number" ? e.httpStatus : null;
+  return status !== null && status >= 400 && status < 500 && status !== 408 && status !== 429;
+}
 
 export type CallApp = (product: string, op: string, input: Json) => Promise<{ status: "ok"; output: unknown } | { status: "held"; holdId: string }>;
 
@@ -71,9 +98,12 @@ export function syncFleet(db: Db, callApp: CallApp, now: () => number = Date.now
       writeFleet(db, d.unchanged ? null : d.teams, { revision: d.revision, error: null }, now());
     } catch (e) {
       const code = isObj(e) && typeof e.code === "string" ? e.code : "error";
-      const msg = `${code}: ${e instanceof Error ? e.message : "fleet read failed"}`.slice(0, 280);
-      // Fleet absent → empty teams (C81: "until then, teams are empty"); transient errors keep the last copy.
-      writeFleet(db, ABSENT.has(code) ? [] : null, { revision: ABSENT.has(code) ? null : st.revision, error: msg }, now());
+      const msg = `Fleet not reachable: ${code}: ${e instanceof Error ? e.message : "fleet read failed"}`.slice(0, 280);
+      const t = now();
+      const expired = st.syncedAt == null || t - st.syncedAt > FLEET_MAX_STALE_MS;
+      // Refusal → clear now; transient → keep the last copy for ≤ 10 min after the last successful read, then clear.
+      // The timer keeps retrying every REFRESH_MS either way.
+      writeFleet(db, isRefusal(e) || expired ? [] : null, { revision: st.revision, error: msg }, t);
     }
   })().finally(() => inflight.delete(db));
   inflight.set(db, p);

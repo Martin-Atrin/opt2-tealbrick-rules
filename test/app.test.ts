@@ -193,6 +193,7 @@ test("Fleet read model: parse, departed people dropped, unchanged keeps, absent 
   assert.equal(fleetTeams(db).length, 0, "no Fleet → teams are empty");
   const st = await run(OP.fleetStatus)({}, opCtx(db, { type: "person", id: OWNER }, callApp as unknown as OpContext["callApp"]));
   assert.equal(st.source, "none");
+  assert.match(st.error, /^Fleet not reachable: not_granted/);
 });
 
 test("background: onStart runs the Fleet read model with the app-initiated callApp (C85); agentsChanged refreshes; pending drafts count", async () => {

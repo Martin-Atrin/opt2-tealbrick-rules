@@ -513,14 +513,18 @@ export function TeamsPage() {
           <div style={row}>
             <Tag tone={st.source === "fleet" ? "ok" : "neutral"}>{st.source === "fleet" ? "Fleet connected" : "No Fleet"}</Tag>
             <span style={muted}>
-              read {when(st.syncedAt)}
+              last successful read {when(st.syncedAt)}
               {st.revision != null ? ` · revision ${st.revision}` : ""}
             </span>
             <Button size="sm" onClick={() => load(true)}>
               Refresh now
             </Button>
           </div>
-          {st.error ? <p style={muted}>Last read problem: {st.error}</p> : null}
+          {st.error ? (
+            <Notice tone="action" role="alert">
+              {st.error}. When Fleet refuses, Rules clears its team copy at once (team rules match nobody). After a temporary failure it keeps the last teams for at most 10 minutes. It retries every minute.
+            </Notice>
+          ) : null}
           {st.teams.length === 0 ? <p>No teams. Deploy Fleet and add teams there; team rules match nobody until then.</p> : null}
           <ul style={ul}>
             {st.teams.map((t) => (

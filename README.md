@@ -42,7 +42,8 @@ operation id (`src/app.ts`) and plain migrations (`migrations/`).
   teams; a claim can only make a decision stricter, never wider (C82).
 - **Fleet read model (C81 G2):** Fleet `directory_get` (`sinceRevision`) through the companion grant, never inside a
   hook: at start and every 60 s with an app-initiated call (C85), on agent-list changes, and from owner pages when
-  older than 60 s. No Fleet = no teams.
+  older than 60 s. Fail safe (A2A-9): a refusal (no grant, not found, unlicensed, any 4xx) clears the copy at once;
+  a transient failure (5xx, timeout) keeps it only while the last successful read is ≤ 10 min old. No Fleet = no teams.
 - **Badge:** pending English drafts count toward the app's `pendingHolds` (TBD badge, C86).
 - **English rules (C84):** the owner's own agent translates and calls `rule_draft_submit` (a draft only); the owner
   approves it on the Drafts page. Rules never calls a model.
