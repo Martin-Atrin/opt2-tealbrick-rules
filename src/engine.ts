@@ -7,6 +7,7 @@
 // - No matching rule = allow (C84). Free/Bound caps and held families stay the floor in the target app.
 // - An `onBehalfOf` claim that is not verified may only NARROW (C82): the decision is the stricter of the
 //   evaluation with the claim and the evaluation without any claim-dependent rule; narrowing lists are merged.
+import { normalizeTag, tagsMatch } from "@opt2-tealbrick/manifest";
 import type { RulesSetInputRuleSpec } from "#kit";
 
 export type RuleSpec = RulesSetInputRuleSpec;
@@ -120,14 +121,20 @@ function normNarrowing(n: RuleSpec["narrowing"]): Narrowing | null {
   return { memoryTags: { ...(t.anyOf ? { anyOf: [...t.anyOf] } : {}), ...(t.noneOf?.length ? { noneOf: [...t.noneOf] } : {}) } };
 }
 
-/** Both narrowings apply: anyOf lists intersect, noneOf lists unite (v1 capabilityNarrowing merge, tags only). */
+/**
+ * Both narrowings apply: anyOf lists intersect, noneOf lists unite (v1 capabilityNarrowing merge, tags only). Tags are
+ * compared after the shared `normalizeTag` (SDK-API §18.1). Disjoint anyOf lists give `anyOf: []` = nothing passes (C115).
+ */
 export function mergeNarrowing(a: Narrowing | null, b: Narrowing | null): Narrowing | null {
   if (!a) return b;
   if (!b) return a;
   const x = a.memoryTags ?? {};
   const y = b.memoryTags ?? {};
-  const any = x.anyOf && y.anyOf ? x.anyOf.filter((t) => (y.anyOf as string[]).includes(t)) : (x.anyOf ?? y.anyOf);
-  const none = [...new Set([...(x.noneOf ?? []), ...(y.noneOf ?? [])])];
+  const norm = (list: readonly string[] | undefined) => (list ? [...new Set(list.map(normalizeTag))] : undefined);
+  const xa = norm(x.anyOf);
+  const ya = norm(y.anyOf);
+  const any = xa && ya ? xa.filter((t) => ya.includes(t)) : (xa ?? ya);
+  const none = [...new Set([...(norm(x.noneOf) ?? []), ...(norm(y.noneOf) ?? [])])];
   return { memoryTags: { ...(any ? { anyOf: any } : {}), ...(none.length ? { noneOf: none } : {}) } };
 }
 
@@ -155,13 +162,9 @@ export function recorded(facts: CallFacts, v: Verdict): boolean {
   return GATED_EFFECTS.has(facts.target.effect) || v.rule !== null;
 }
 
-/** Tags pass the narrowing: at least one of `anyOf` (when given) and none of `noneOf`. */
+/** Tags pass the narrowing: THE G5 comparison, the manifest package's `tagsMatch` (Knowledge uses the same function, L1). */
 export function tagsPass(tags: readonly string[], n: Narrowing): boolean {
-  const t = n.memoryTags;
-  if (!t) return true;
-  if (t.anyOf && !t.anyOf.some((x) => tags.includes(x))) return false;
-  if (t.noneOf?.some((x) => tags.includes(x))) return false;
-  return true;
+  return tagsMatch(n.memoryTags, tags);
 }
 
 const MAX_NODES = 20_000;
@@ -222,6 +225,8 @@ export function specProblem(spec: RuleSpec): string {
   if (spec.narrowing && spec.outcome.decision !== "allow") return "narrowing applies only to rules that allow";
   const t = spec.narrowing?.memoryTags;
   if (t && !t.anyOf && !(t.noneOf?.length)) return "narrowing.memoryTags needs anyOf or noneOf";
+  // Writer strict (L24, C115): an owner-written empty anyOf would hide every memory; name at least one tag.
+  if (t?.anyOf && !t.anyOf.some((tag) => normalizeTag(tag))) return "narrowing.memoryTags.anyOf needs at least one tag";
   const m = spec.match;
   if (m.operations?.length && !m.products?.length) return "operations need products (an operation id is unique only within one app)";
   return "";

@@ -119,6 +119,21 @@ test("mergeNarrowing and spec checks", () => {
   assert.match(specProblem(spec({ match: { operations: ["x_y"] } })), /operations need products/);
   assert.equal(specProblem(spec({ decision: "allow", narrowing: { memoryTags: {} } })), "narrowing.memoryTags needs anyOf or noneOf");
   assert.equal(specProblem(spec({})), "");
+  // C115 writer strict: an owner-written empty anyOf would hide every memory.
+  assert.equal(specProblem(spec({ decision: "allow", narrowing: { memoryTags: { anyOf: [] } } })), "narrowing.memoryTags.anyOf needs at least one tag");
+  assert.equal(specProblem(spec({ decision: "allow", narrowing: { memoryTags: { anyOf: ["  "], noneOf: ["x"] } } })), "narrowing.memoryTags.anyOf needs at least one tag");
+  assert.equal(specProblem(spec({ decision: "allow", narrowing: { memoryTags: { anyOf: ["work"] } } })), "");
+  // Merge compares after the shared normalizeTag (SDK-API §18.1).
+  assert.deepEqual(mergeNarrowing({ memoryTags: { anyOf: ["Work", "ops"] } }, { memoryTags: { anyOf: [" work"], noneOf: ["Secret"] } }), { memoryTags: { anyOf: ["work"], noneOf: ["secret"] } });
+});
+
+test("G5 shared comparison (manifest tagsMatch): case-insensitive, and a merged empty anyOf redacts every tagged item (C115)", () => {
+  const out = { results: [{ id: 1, tags: ["WORK"] }, { id: 2, tags: [" Personal "] }, { id: 3, tags: [] }] };
+  assert.deepEqual(redactionsFor(out, { memoryTags: { anyOf: ["work"] } }), ["/results/2", "/results/1"]);
+  assert.deepEqual(redactionsFor(out, { memoryTags: { noneOf: ["personal"] } }), ["/results/1"]);
+  const disjoint = mergeNarrowing({ memoryTags: { anyOf: ["a"] } }, { memoryTags: { anyOf: ["b"] } });
+  assert.deepEqual(disjoint, { memoryTags: { anyOf: [] } });
+  assert.deepEqual(redactionsFor(out, disjoint as never), ["/results/2", "/results/1", "/results/0"], "anyOf [] = nothing passes");
 });
 
 test("gate answers: hold needs spec 0.1.13, otherwise it is refused with the reason (fail closed)", () => {

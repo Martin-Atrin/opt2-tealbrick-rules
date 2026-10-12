@@ -80,6 +80,7 @@ test("rules: create, update with revision check, history, delete keeps history; 
   assert.equal(updated.rev, 2);
   await assert.rejects(run(OP.rulesSet)({ id: created.id, expectedRev: 1, rule: spec({}) }, owner), { code: "revision_conflict" });
   await assert.rejects(run(OP.rulesSet)({ rule: spec({ decision: "deny", narrowing: { memoryTags: { anyOf: ["w"] } } }) }, owner), { code: "input_invalid" });
+  await assert.rejects(run(OP.rulesSet)({ rule: spec({ decision: "allow", narrowing: { memoryTags: { anyOf: [] } } }) }, owner), { code: "input_invalid", message: "narrowing.memoryTags.anyOf needs at least one tag" });
   await assert.rejects(run(OP.rulesSet)({ rule: spec({}) }, opCtx(db, { type: "agent", id: AGENT_A })), { code: "forbidden" });
   assert.equal(liveRules(db).length, 1);
   const del = await run(OP.rulesDelete)({ id: created.id, expectedRev: 2 }, owner);
