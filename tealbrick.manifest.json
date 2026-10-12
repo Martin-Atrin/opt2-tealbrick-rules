@@ -4,7 +4,7 @@
   "id": "rules",
   "name": "Rules and Approvals",
   "summary": "Rules and Approvals is the workspace policy: it allows, refuses or holds other apps' calls, always with a recorded reason.",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "sdkMajor": 1,
   "publisher": {
     "name": "Teal Brick opt2"
