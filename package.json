@@ -1,0 +1,40 @@
+{
+  "name": "opt2-tealbrick-rules",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Rules and Approvals: a Teal Brick opt2 miniapp.",
+  "license": "MIT",
+  "type": "module",
+  "packageManager": "pnpm@9.15.4+sha512.b2dc20e2fc72b3e18848459b37359a32064663e5627a51e4c74b2c29dd8e8e0491483c3abb40789cfd578bf362fb6ba8261b05f0387d76792ed6e23ea3b1b6a0",
+  "engines": {
+    "node": ">=24"
+  },
+  "imports": {
+    "#kit": "./dist/kit/index.js"
+  },
+  "scripts": {
+    "kit": "tb-gen kit && tsc -p gen/kit/rules-kit --outDir dist/kit",
+    "start": "node --run kit && node src/main.ts",
+    "typecheck": "node --run kit && tsc --noEmit",
+    "lint": "biome check .",
+    "test": "node --run kit && node --test 'test/**/*.test.ts'",
+    "conformance": "node --run kit && tb-conformance app --start conformance.start.ts --manifest tealbrick.manifest.json --test-roots",
+    "build": "node --run kit && tsc -p tsconfig.build.json && node scripts/build-ui.ts",
+    "gen": "tb-gen all"
+  },
+  "dependencies": {
+    "@opt2-tealbrick/manifest": "https://github.com/Martin-Atrin/opt2-tealbrick-sdk/releases/download/manifest-v0.1.6/opt2-tealbrick-manifest-0.1.6.tgz",
+    "@opt2-tealbrick/miniapp-sdk": "https://github.com/Martin-Atrin/opt2-tealbrick-sdk/releases/download/miniapp-sdk-v0.1.11/opt2-tealbrick-miniapp-sdk-0.1.11.tgz"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.5.15",
+    "@opt2-tealbrick/conformance": "https://github.com/Martin-Atrin/opt2-tealbrick-sdk/releases/download/conformance-v0.1.7/opt2-tealbrick-conformance-0.1.7.tgz",
+    "@opt2-tealbrick/ui": "https://github.com/Martin-Atrin/opt2-tealbrick-packages/releases/download/ui-v0.1.1/opt2-tealbrick-ui-0.1.1.tgz",
+    "@types/node": "24.19.2",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "react": "19.3.0",
+    "react-dom": "19.3.0",
+    "typescript": "7.0.2"
+  }
+}
