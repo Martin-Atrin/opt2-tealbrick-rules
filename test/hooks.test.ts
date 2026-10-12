@@ -2,7 +2,7 @@
 // rules.narrowing v1 from an onBehalfOf claim resolved through the Fleet read model, after-hook redactions.
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { hookResponseProblem } from "@opt2-tealbrick/manifest";
+import { hookResponseProblem, reduceBeforeChain } from "@opt2-tealbrick/manifest";
 import type { Json } from "@opt2-tealbrick/miniapp-sdk";
 import type { RuleSpec } from "../src/engine.ts";
 import { syncFleet } from "../src/fleet.ts";
@@ -64,7 +64,13 @@ test("gate: hold rule → policy hold verdict the SDK/bridge validator accepts (
   const { db } = migratedDb();
   saveRule(db, { spec: spec({ match: { effects: ["money"] }, decision: "hold", reason: "Payments need the owner" }), actor: OWNER });
   const held = await call("rules_gate", hookReq("before", { effect: "money", op: "pay", callId: "cal_h1" }), hookCtx(db));
-  assert.deepEqual(Object.keys(held).sort(), ["allow", "hold"]);
+  assert.deepEqual(Object.keys(held).sort(), ["allow", "hold", "reason"]);
+  assert.equal(held.reason, (held.hold as { reason: string }).reason, "an older bridge refuses with the same reason (fail closed)");
+  assert.deepEqual(reduceBeforeChain([{ by: "rules/rules_gate", answer: held as never }]), {
+    kind: "hold",
+    by: "rules/rules_gate",
+    verdict: { family: "policy", reason: (held.hold as { reason: string }).reason },
+  });
   assert.equal(held.allow, false);
   assert.equal((held.hold as { family: string }).family, "policy");
   assert.match((held.hold as { reason: string }).reason, /^Needs owner review: Payments need the owner \(rule rul_/);

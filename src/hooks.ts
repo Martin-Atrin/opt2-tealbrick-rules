@@ -14,7 +14,7 @@ export const GATE_BUDGET_MS = 250;
  * validator (manifest 0.1.8, the same the SDK route and the bridge use): if it refused a policy hold, Rules would
  * fall back to refusing (fail closed) instead of sending an answer the SDK would turn into hook_failed.
  */
-export const HOLD_SUPPORTED = hookResponseProblem("before", { allow: false, hold: { family: "policy", reason: "probe" } }, "rules") === null;
+export const HOLD_SUPPORTED = hookResponseProblem("before", { allow: false, reason: "probe", hold: { family: "policy", reason: "probe" } }, "rules") === null;
 export const REASON_MAX = 280;
 export const FAIL_CLOSED = "Rules could not decide this call in time, so it is refused (fail closed).";
 
@@ -51,13 +51,20 @@ export function factsOf(req: HookRequest, db: Db): CallFacts {
   };
 }
 
-export type GateAnswer = { allow: true } | { allow: false; reason: string } | { allow: false; hold: { family: "policy"; reason: string } };
+/**
+ * A hold also carries `reason`: a bridge with the hold verdict (≥ 0.1.16) keeps the hold and ignores it (manifest
+ * reduceBeforeChain); an older bridge sees `{allow: false, reason}` and refuses the call with that reason (fail closed).
+ */
+export type GateAnswer = { allow: true } | { allow: false; reason: string } | { allow: false; reason: string; hold: { family: "policy"; reason: string } };
 
 /** The before-hook answer for a verdict. Hold without spec 0.1.13 → refuse with the reason (fail closed). */
 export function gateAnswer(v: Verdict, holdSupported = HOLD_SUPPORTED): { answer: GateAnswer; answered: "allow" | "deny" | "hold" } {
   const tag = v.rule ? ` (rule ${v.rule.id})` : "";
   if (v.decision === "allow") return { answer: { allow: true }, answered: "allow" };
-  if (v.decision === "hold" && holdSupported) return { answer: { allow: false, hold: { family: "policy", reason: clamp(`Needs owner review: ${v.reason}${tag}`) } }, answered: "hold" };
+  if (v.decision === "hold" && holdSupported) {
+    const reason = clamp(`Needs owner review: ${v.reason}${tag}`);
+    return { answer: { allow: false, reason, hold: { family: "policy", reason } }, answered: "hold" };
+  }
   if (v.decision === "hold")
     return { answer: { allow: false, reason: clamp(`Rules: ${v.reason}${tag}. This needs owner review, which this workspace cannot hold yet, so the call is refused.`) }, answered: "deny" };
   return { answer: { allow: false, reason: clamp(`Rules: ${v.reason}${tag}`) }, answered: "deny" };

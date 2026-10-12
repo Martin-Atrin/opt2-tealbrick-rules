@@ -35,6 +35,10 @@ operation id (`src/app.ts`) and plain migrations (`migrations/`).
   the verdict in the call proof and the TARGET app holds the call in its own holds table (`heldBy` = `rules/rules_gate`).
   The owner decides there; the retry of the same input runs once; a refusal on the retry still wins. If the hook-answer
   validator ever refused a policy hold, Rules would refuse instead (fail closed).
+- **Bridge version (C104):** holds need a bridge that carries the hold verdict (`hv`, bridge 0.1.17 per C104; the
+  manifest declares `requires.bridge` from manifest 0.1.10 / spec 0.1.15 on). On an older bridge a hold is treated as
+  a deny: the hold answer also carries `reason`, so the old bridge refuses the call with "Needs owner review: <reason>"
+  (fail closed); nothing runs without the owner.
 - **Context (`rules_context`):** `rules.narrowing` v1 `{v, ruleId, reason, memoryTags {anyOf, noneOf}}` (Knowledge
   reads it), `rules.matched`, `rules.onBehalfOf`.
 - **After (`rules_filter`, reads):** redacts result objects whose `tags[]` fail the narrowing.
