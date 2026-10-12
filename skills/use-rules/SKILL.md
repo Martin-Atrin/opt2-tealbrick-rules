@@ -1,12 +1,31 @@
 ---
 name: use-rules
-description: How to list and add items in Rules and Approvals.
+description: How Rules and Approvals decides your calls, how to ask why, and how to draft a rule from the owner's English.
 ---
 # Using Rules and Approvals
 
-{{agent.name}}, you can keep short items in collections.
+{{agent.name}}, the owner of this workspace keeps rules in Rules and Approvals. Rules checks other apps' calls before they run. It answers allow, refuse or hold, always with a reason.
 
-- Call `rules__items_list` to see the newest items. Pass `collection` to read one collection; leave it out to read every collection you may see.
-- Call `rules__item_create` with a `title` to add an item. Without `collection` it goes into your own collection.
-- Always send an idempotency key with `item_create`; repeating a call with the same key returns the first result.
-- If a call answers `held`, the owner must approve it. Poll `rules__tb_hold_status` with the `holdId`, then repeat the same call.
+## When a call is refused or held
+
+- A refusal from Rules starts with `Rules:` and names the rule (for example `(rule rul_…)`). Do not retry the same call. Tell the owner the reason.
+- A held call needs the owner's review. Poll the target app's `tb_hold_status` with the `holdId`. After approval, repeat the same call once with the same input.
+- Call `rules__rules_explain` to see why your recent calls were allowed, refused or held. Pass `callId` to ask about one call. You see only your own calls.
+
+## Drafting a rule from the owner's English
+
+Rules never calls a model. When the owner asks you to set a rule in plain English, you translate it:
+
+1. Read the owner's sentence. Split it into one structured rule per outcome (at most 10).
+2. Call `rules__rule_draft_submit` with `text` (the owner's exact words), `rules` (your structured rules) and an optional `note` (your doubts). Send an idempotency key.
+3. Tell the owner to open Rules and Approvals, page Drafts, and approve or reject it. Nothing applies before the owner approves.
+
+A structured rule has:
+- `title`, `priority` (0..1000, lower runs first; the first matching rule decides), `active`.
+- `match` (all named criteria must match; an empty list means any): `agents` (caller ids), `modes` (`free`, `bound`), `products`, `operations` (needs `products`), `effects` (`read`, `write`, `outward`, `destructive`, `money`), `onBehalfOf` (`teams` = Fleet team ids, `ids` = person ids or handles such as `slack:U123`, `kinds`).
+- `outcome`: `decision` (`allow`, `deny`, `hold`) and `reason` (shown to agents, max 280 characters).
+- `narrowing` (only with `allow`): `memoryTags.anyOf` (only memories with one of these tags) and `memoryTags.noneOf` (never memories with these tags).
+
+Example. "When someone from team Sales tags you, talk only about work, use only work memories, and never touch money" becomes two rules: `{match: {effects: ["money"], onBehalfOf: {teams: ["<sales team id>"]}}, outcome: {decision: "deny", reason: "Requests from Sales may not involve money"}, priority: 10}` and `{match: {onBehalfOf: {teams: ["<sales team id>"]}}, outcome: {decision: "allow", reason: "Requests from Sales see only work memories"}, narrowing: {memoryTags: {anyOf: ["work"]}}, priority: 20}`.
+
+When there is no matching rule, a call is allowed. Who asked ("on behalf of") is a claim; rules about it can only make a decision stricter, never wider.

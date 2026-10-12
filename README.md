@@ -24,20 +24,42 @@ A Teal Brick opt2 miniapp (product id `rules`), built on `@opt2-tealbrick/miniap
 validation, OpenAPI, receipts, holds, idempotency, scopes, backups and status from it. You write handlers by
 operation id (`src/app.ts`) and plain migrations (`migrations/`).
 
+## What Rules does
+
+- **Gate (`rules_gate`, before hook, every product):** the first active rule that matches the call decides (lower
+  priority first): allow, refuse or hold, always with the rule's reason. No matching rule = allow (C84). Answers from
+  local cached tables only (no app call, no model call), with an own budget of 250 ms (hook limit 1 s); any error or
+  overrun refuses (fail closed). Outward, destructive and money calls, and every call a rule decided, are recorded as
+  decision traces keyed by the bridge `callId` (join with the target app's receipts).
+- **Hold:** needs spec 0.1.13 (before-hook hold verdict, family `policy`). Feature check on the spec vocabulary; until
+  then a hold rule refuses with its reason.
+- **Context (`rules_context`):** `rules.narrowing` v1 `{v, ruleId, reason, memoryTags {anyOf, noneOf}}` (Knowledge
+  reads it), `rules.matched`, `rules.onBehalfOf`.
+- **After (`rules_filter`, reads):** redacts result objects whose `tags[]` fail the narrowing.
+- **On behalf of:** the bridge copies the runner's claim into `tb.onBehalfOf` (unverified). Rules resolves it to Fleet
+  teams; a claim can only make a decision stricter, never wider (C82).
+- **Fleet read model (C81 G2):** Fleet `directory_get` through the companion grant, outside calls: every 60 s once the
+  SDK offers background companion calls (C85, feature check), and from owner pages when older than 60 s. No Fleet =
+  no teams.
+- **English rules (C84):** the owner's own agent translates and calls `rule_draft_submit` (a draft only); the owner
+  approves it on the Drafts page. Rules never calls a model.
+
 ## Layout
 
 | Path | Content |
 |---|---|
-| `tealbrick.manifest.json` | identity, runtime (data + backup volumes), operations, scopes, skills, backups, UI paths |
-| `src/app.ts` | `defineApp`: one typed handler per operation (op ids and I/O types from `#kit`), agent first-sight event |
-| `src/items.ts` | the app's table access (plain functions over the SDK `Db`) |
-| `src/main.ts` | `startApp(app, process.env)` |
-| `src/ui/` | React UI (`<TbProvider>` + `<AppShell>` from `@opt2-tealbrick/ui`), built to `dist/ui` |
+| `tealbrick.manifest.json` | the only description: ops (person: rules, drafts, decisions, preview, teams; agent: `rules_explain`, `rule_draft_submit`), hooks, Fleet companion |
+| `src/engine.ts` | pure rule engine: match, first match, narrow-only claims, narrowing merge, redaction pointers |
+| `src/hooks.ts` | the three hook handlers (fail closed) |
+| `src/store.ts` | tables: rules + revisions, drafts, decision traces, Fleet copy (cached for the gate) |
+| `src/fleet.ts` | Fleet read model sync |
+| `src/app.ts` | `defineApp`: one typed handler per operation, hooks, events, `onStart` |
+| `src/ui/` | owner UI in `<AppShell>`: Rules (editor + dry run), Drafts, Decisions, Teams, Holds, Agents |
 | `migrations/0001_init.sql` | baseline; forward-only, never edit a released file |
-| `skills/use-rules/SKILL.md` | the agent skill (frontmatter `name`, `description`) |
+| `skills/use-rules/SKILL.md` | the agent skill: refusals, explain, drafting rules from English |
 | `scripts/build-ui.ts` | UI build without a bundler (tsc output + vendored modules + import map) |
 | `gen/` (not committed) | `tb-gen` output; `node --run kit` generates the kit and compiles it to `dist/kit` (`#kit` import) |
-| `Dockerfile` | `node:24-slim` pinned by digest, pnpm build to `dist/`, non-root, `CMD ["node", "dist/main.js"]` |
+| `Dockerfile` | the one opt2 app Dockerfile pattern |
 | `.woodpecker/ci.yaml` | the opt2 CI template, byte-identical copy (do not edit) |
 | `tealbrick-ci.json` | CI settings: kind `miniapp`, one image |
 

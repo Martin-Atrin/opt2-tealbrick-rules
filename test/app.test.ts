@@ -1,17 +1,21 @@
-// Smoke test: the app boots on the SDK (manifest, handler set and migrations accepted), serves the derived routes,
-// and its handlers work against the migrated table. Agent calls through a bridge are covered by `pnpm conformance`.
+// The app on the SDK: manifest + kit + boot, person ops (rules with revisions, drafts approved once, preview,
+// decisions), the agent ops (draft only; explain own calls only), and the Fleet read model sync.
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { DatabaseSync } from "node:sqlite";
 import { test } from "node:test";
 import { manifestDigest, validateManifest } from "@opt2-tealbrick/manifest";
-import { type Db, defineApp, type OpContext, startApp } from "@opt2-tealbrick/miniapp-sdk";
+import { defineApp, type OpContext, startApp } from "@opt2-tealbrick/miniapp-sdk";
 import { MANIFEST_DIGEST, OP } from "#kit";
 import { definition, handlers, manifest } from "../src/app.ts";
-import { COLLECTION, createItem, listItems } from "../src/items.ts";
+import { parseDirectory, syncFleet } from "../src/fleet.ts";
+import { fleetIndex, fleetState, fleetTeams, liveRules, recordDecision } from "../src/store.ts";
+import { AGENT_A, AGENT_B, migratedDb, OWNER, opCtx, spec } from "./helpers.ts";
+
+type Run = (input: unknown, ctx: OpContext) => Promise<any>;
+const run = (id: keyof typeof handlers) => (handlers[id] as unknown as { run: Run }).run;
 
 async function freePort(): Promise<number> {
   return new Promise((resolve, reject) => {
@@ -24,27 +28,29 @@ async function freePort(): Promise<number> {
   });
 }
 
-/** node:sqlite handle shaped like the SDK's Db (the SDK gives handlers the same interface). */
-function openDb(file: string): { db: Db; close(): void } {
-  const raw = new DatabaseSync(file);
-  const db = { exec: (sql: string) => raw.exec(sql), prepare: (sql: string) => raw.prepare(sql), transaction: <T>(fn: () => T) => fn() };
-  return { db: db as unknown as Db, close: () => raw.close() };
-}
-
-test("manifest validates", () => {
+test("manifest validates; hooks gate every product within the time limits", () => {
   const v = validateManifest(manifest);
   assert.equal(v.ok, true, v.ok ? "" : JSON.stringify(v.errors));
+  const byId = Object.fromEntries((manifest.hooks ?? []).map((h) => [h.id, h]));
+  assert.deepEqual(Object.keys(byId).sort(), ["rules_context", "rules_filter", "rules_gate"]);
+  assert.deepEqual(byId.rules_gate.match, { products: ["*"] });
+  assert.ok((byId.rules_gate.timeoutMs ?? 2000) <= 1000, "gate answers well under 2 s");
+  assert.deepEqual(byId.rules_filter.match.effects, ["read"]);
+  assert.deepEqual(manifest.companions?.map((c) => [c.product, c.operations]), [["fleet", ["directory_get"]]]);
 });
 
-test("the generated kit matches the manifest and every operation has exactly one handler", () => {
+test("the generated kit matches the manifest and every operation and hook has exactly one handler", () => {
   assert.equal(MANIFEST_DIGEST, manifestDigest(manifest), "kit is stale: run node --run kit");
   const ids = manifest.operations.map((o) => o.id).sort();
   assert.deepEqual(Object.values(OP).sort(), ids);
   assert.deepEqual(Object.keys(handlers).sort(), ids);
+  assert.deepEqual(Object.keys(definition.hooks ?? {}).sort(), (manifest.hooks ?? []).map((h) => h.id).sort());
+  const agentOps = manifest.operations.filter((o) => o.audience === "agent").map((o) => o.id);
+  assert.deepEqual(agentOps.sort(), ["rule_draft_submit", "rules_explain"], "rule editing is person-only");
 });
 
-test("boots on the SDK, serves derived routes, handlers work on the migrated table", async (t) => {
-  const dir = mkdtempSync(join(tmpdir(), `${manifest.id}-test-`));
+test("boots on the SDK and serves the derived routes", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "rules-test-"));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   const port = await freePort();
   const local = { ...manifest, runtime: { ...manifest.runtime, port } };
@@ -54,41 +60,137 @@ test("boots on the SDK, serves derived routes, handlers work on the migrated tab
     const health = (await (await fetch(`${base}/tb/v1/health`)).json()) as { status: string; manifestDigest: string };
     assert.equal(health.status, "ok");
     assert.equal(health.manifestDigest, manifestDigest(local));
-    const served = await (await fetch(`${base}/tb/v1/manifest`)).json();
-    assert.equal(manifestDigest(served), manifestDigest(local));
     const openapi = (await (await fetch(`${base}/tb/v1/openapi.json`)).json()) as { paths: Record<string, unknown> };
-    for (const op of manifest.operations) assert.ok(Object.keys(openapi.paths).some((p) => p.endsWith(`/${op.id}`)), `openapi lists ${op.id}`);
-    // agent operations need a bridge (call proof + grant); app-alone mode refuses them
-    const refused = await fetch(`${base}/tb/v1/ops/items_list`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ input: {} }) });
-    assert.equal(refused.status, 503);
+    for (const op of manifest.operations.filter((o) => o.audience === "agent")) assert.ok(Object.keys(openapi.paths).some((p) => p.endsWith(`/${op.id}`)), `openapi lists ${op.id}`);
+    // hooks need a bridge call proof: an unsigned hook call is refused
+    const hook = await fetch(`${base}/tb/v1/hooks/rules_gate`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+    assert.ok(hook.status >= 400);
   } finally {
     await running.stop();
   }
+});
 
-  const { db, close } = openDb(join(dir, "app.db"));
-  t.after(close);
-  const caller = { type: "agent", id: "agt_01J0000000000000000000000A", name: "Agent A", mode: "free" };
-  const ctx = (readable: string[]) => ({ db, caller, scope: { readable: async () => readable } }) as unknown as OpContext;
-
-  assert.equal(handlers.item_create.scope?.({ title: "x" }, caller as OpContext["caller"]), caller.id, "default target is the own collection");
-  assert.equal(handlers.items_list.scope?.({}, caller as OpContext["caller"]), null, "no collection = across readable ones");
-
-  const created = (await handlers.item_create.run({ title: "first" }, ctx([]))) as { id: string; collection: string };
-  assert.equal(created.collection, caller.id);
-  assert.match(created.id, /^itm_/);
-  createItem(db, { collection: "shared", title: "second", createdBy: caller.id }, Date.now() + 1000);
-
-  const mine = (await handlers.items_list.run({}, ctx([caller.id]))) as { items: { title: string }[] };
+test("rules: create, update with revision check, history, delete keeps history; person only", async () => {
+  const { db } = migratedDb();
+  const owner = opCtx(db, { type: "person", id: OWNER });
+  const created = (await run(OP.rulesSet)({ rule: spec({ title: "No money", match: { effects: ["money"] } }) }, owner)).rule;
+  assert.match(created.id, /^rul_/);
+  assert.equal(created.rev, 1);
+  const updated = (await run(OP.rulesSet)({ id: created.id, expectedRev: 1, rule: spec({ title: "No money at all", match: { effects: ["money"] } }) }, owner)).rule;
+  assert.equal(updated.rev, 2);
+  await assert.rejects(run(OP.rulesSet)({ id: created.id, expectedRev: 1, rule: spec({}) }, owner), { code: "revision_conflict" });
+  await assert.rejects(run(OP.rulesSet)({ rule: spec({ decision: "deny", narrowing: { memoryTags: { anyOf: ["w"] } } }) }, owner), { code: "input_invalid" });
+  await assert.rejects(run(OP.rulesSet)({ rule: spec({}) }, opCtx(db, { type: "agent", id: AGENT_A })), { code: "forbidden" });
+  assert.equal(liveRules(db).length, 1);
+  const del = await run(OP.rulesDelete)({ id: created.id, expectedRev: 2 }, owner);
+  assert.equal(del.rev, 3);
+  assert.equal(liveRules(db).length, 0, "deleted rules leave evaluation at once");
+  const got = await run(OP.rulesGet)({ id: created.id }, owner);
+  assert.equal(got.deleted, true);
   assert.deepEqual(
-    mine.items.map((i) => i.title),
-    ["first"],
+    got.revisions.map((r: { change: string }) => r.change),
+    ["deleted", "updated", "created"],
   );
-  const both = (await handlers.items_list.run({ limit: 1 }, ctx([caller.id, "shared"]))) as { items: { title: string }[] };
+  assert.equal((await run(OP.rulesList)({}, owner)).rules.length, 0);
+  assert.equal((await run(OP.rulesList)({ includeDeleted: true }, owner)).rules.length, 1);
+});
+
+test("English authoring: the agent submits a DRAFT only; the owner approves once; rules then apply", async () => {
+  const { db } = migratedDb();
+  const agent = opCtx(db, { type: "agent", id: AGENT_A, name: "Owner's agent", mode: "free" });
+  const owner = opCtx(db, { type: "person", id: OWNER });
+  const text = "When someone from team X tags you: only work topics, only work memories, nothing with money.";
+  const sub = await run(OP.ruleDraftSubmit)({ text, rules: [spec({ title: "X money", match: { effects: ["money"], onBehalfOf: { teams: ["tm_x"] } }, decision: "deny", reason: "no money for team X" })] }, agent);
+  assert.equal(sub.status, "pending");
+  assert.equal(liveRules(db).length, 0, "a draft never applies by itself");
+  const drafts = (await run(OP.draftsList)({ status: "pending" }, owner)).drafts;
+  assert.equal(drafts[0].text, text);
+  assert.equal(drafts[0].submittedBy.id, AGENT_A);
+  await assert.rejects(run(OP.draftDecide)({ id: sub.draftId, decision: "approve" }, agent), { code: "forbidden" });
+  const decided = (await run(OP.draftDecide)({ id: sub.draftId, decision: "approve" }, owner)).draft;
+  assert.equal(decided.status, "approved");
+  assert.equal(decided.ruleIds.length, 1);
+  assert.equal(liveRules(db)[0]?.id, decided.ruleIds[0]);
+  await assert.rejects(run(OP.draftDecide)({ id: sub.draftId, decision: "reject" }, owner), { code: "draft_decided" });
+  const bad = run(OP.ruleDraftSubmit)({ text: "x", rules: [spec({ decision: "deny", narrowing: { memoryTags: { noneOf: ["a"] } } })] }, agent);
+  await assert.rejects(bad, { code: "input_invalid" });
+});
+
+test("preview: dry run with an unsaved candidate and per-rule steps", async () => {
+  const { db } = migratedDb();
+  const owner = opCtx(db, { type: "person", id: OWNER });
+  await run(OP.rulesSet)({ rule: spec({ title: "bound agents read only", priority: 5, match: { modes: ["bound"], effects: ["outward"] }, reason: "bound agents may not send" }) }, owner);
+  const call = { caller: { type: "agent", id: AGENT_A, mode: "bound" }, target: { product: "connect", op: "buzz_dm", effect: "outward" } };
+  const p = await run(OP.rulesPreview)({ call }, owner);
+  assert.equal(p.decision, "deny");
+  assert.equal(p.ruleTitle, "bound agents read only");
+  const free = await run(OP.rulesPreview)({ call: { ...call, caller: { ...call.caller, mode: "free" } } }, owner);
+  assert.equal(free.decision, "allow");
+  const cand = await run(OP.rulesPreview)({ call, candidate: spec({ title: "candidate", priority: 1, decision: "hold", reason: "review" }) }, owner);
+  assert.equal(cand.ruleId, "candidate");
+  assert.equal(cand.answered, "deny", "hold is refused until spec 0.1.13");
+  assert.equal(cand.steps.length, 2);
+});
+
+test("rules_explain: an agent sees only its own calls' decisions", async () => {
+  const { db } = migratedDb();
+  const f = (caller: string) => ({ caller: { type: "agent", id: caller, mode: "free" }, target: { product: "connect", op: "buzz_dm", effect: "outward" }, claim: null, claimVerified: false, claimTeams: [] });
+  recordDecision(db, { callId: "cal_a", phase: "before", facts: f(AGENT_A), decision: "deny", answered: "deny", reason: "no", rule: { id: "rul_1", rev: 1, title: "t" }, durationUs: 10 });
+  recordDecision(db, { callId: "cal_b", phase: "before", facts: f(AGENT_B), decision: "allow", answered: "allow", reason: "ok", rule: null, durationUs: 10 });
+  const mine = await run(OP.rulesExplain)({}, opCtx(db, { type: "agent", id: AGENT_A }));
   assert.deepEqual(
-    both.items.map((i) => i.title),
-    ["second"],
-    "newest first, limited",
+    mine.decisions.map((d: { callId: string }) => d.callId),
+    ["cal_a"],
   );
-  assert.deepEqual(listItems(db, [], 10), [], "no readable collection = no items");
-  assert.equal(COLLECTION, manifest.scopes?.[0]?.type);
+  assert.deepEqual((await run(OP.rulesExplain)({ callId: "cal_b" }, opCtx(db, { type: "agent", id: AGENT_A }))).decisions, []);
+  const all = await run(OP.decisionsList)({}, opCtx(db, { type: "person", id: OWNER }));
+  assert.equal(all.items.length, 2);
+});
+
+const DIRECTORY = {
+  revision: 7,
+  unchanged: false,
+  teams: [
+    {
+      id: "tm_x",
+      name: "Team X",
+      members: [
+        { kind: "person", id: "psn_1", name: "P1", role: "member", handles: ["slack:u777", "npub1ABC"] },
+        { kind: "person", id: "psn_2", name: "P2", role: "member", handles: ["telegram:9"] },
+        { kind: "agent", id: AGENT_A, name: "A", role: "lead" },
+      ],
+    },
+  ],
+  people: [{ id: "psn_2", status: "departed", handles: ["telegram:9"] }],
+  agents: [],
+};
+
+test("Fleet read model: parse, departed people dropped, unchanged keeps, absent Fleet empties, transient error keeps", async () => {
+  const d = parseDirectory(DIRECTORY);
+  assert.deepEqual(d.teams[0]?.keys.sort(), [`agent:${AGENT_A}`, "handle:buzz:npub1abc", "handle:slack:U777", "person:psn_1"].sort());
+  const { db } = migratedDb();
+  let answer: unknown = DIRECTORY;
+  let fail: string | null = null;
+  const inputs: unknown[] = [];
+  const callApp = async (_p: string, _o: string, input: unknown) => {
+    inputs.push(input);
+    if (fail) throw Object.assign(new Error(fail), { code: fail });
+    return { status: "ok" as const, output: answer };
+  };
+  await syncFleet(db, callApp);
+  assert.deepEqual(fleetTeams(db), [{ id: "tm_x", name: "Team X", people: 2, agents: 1 }]);
+  assert.deepEqual(fleetIndex(db).get("handle:slack:U777"), ["tm_x"]);
+  answer = { revision: 7, unchanged: true, teams: [], people: [], agents: [] };
+  await syncFleet(db, callApp);
+  assert.deepEqual(inputs.at(-1), { sinceRevision: 7 });
+  assert.equal(fleetTeams(db).length, 1, "unchanged keeps the copy");
+  fail = "bridge_unavailable";
+  await syncFleet(db, callApp);
+  assert.equal(fleetTeams(db).length, 1, "a transient error keeps the last copy");
+  assert.match(String(fleetState(db).error), /bridge_unavailable/);
+  fail = "not_granted";
+  await syncFleet(db, callApp);
+  assert.equal(fleetTeams(db).length, 0, "no Fleet → teams are empty");
+  const st = await run(OP.fleetStatus)({}, opCtx(db, { type: "person", id: OWNER }, callApp as unknown as OpContext["callApp"]));
+  assert.equal(st.source, "none");
 });
