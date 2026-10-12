@@ -69,6 +69,7 @@ export function opCtx(db: Db, caller: { type: "person" | "agent"; id: string; na
     caller: { type: caller.type, id: caller.id, name: caller.name ?? caller.id, mode: caller.mode ?? null },
     log: quiet,
     receipt: { summary() {}, meta: (v: Json) => meta.push(v) },
+    statusChanged() {},
     callApp: callApp ?? (async () => Promise.reject(Object.assign(new Error("no grant"), { code: "not_granted" }))),
     signal: new AbortController().signal,
   } as unknown as OpContext;

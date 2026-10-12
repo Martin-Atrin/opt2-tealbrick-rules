@@ -156,6 +156,10 @@ export function submitDraft(db: Db, input: { text: string; note?: string; rules:
   return draftView(db.prepare("SELECT * FROM drafts WHERE id = ?").get(id) as Record<string, unknown>);
 }
 
+export function pendingDraftCount(db: Db): number {
+  return Number(db.prepare("SELECT COUNT(*) AS n FROM drafts WHERE status = 'pending'").get()?.n ?? 0);
+}
+
 export function listDrafts(db: Db, status: DraftView["status"] | undefined, limit: number): DraftView[] {
   const rows = status
     ? db.prepare("SELECT * FROM drafts WHERE status = ? ORDER BY submitted_at DESC, id DESC LIMIT ?").all(status, limit)

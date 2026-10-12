@@ -31,16 +31,19 @@ operation id (`src/app.ts`) and plain migrations (`migrations/`).
   local cached tables only (no app call, no model call), with an own budget of 250 ms (hook limit 1 s); any error or
   overrun refuses (fail closed). Outward, destructive and money calls, and every call a rule decided, are recorded as
   decision traces keyed by the bridge `callId` (join with the target app's receipts).
-- **Hold:** needs spec 0.1.13 (before-hook hold verdict, family `policy`). Feature check on the spec vocabulary; until
-  then a hold rule refuses with its reason.
+- **Hold (spec 0.1.13):** a hold rule answers `{allow: false, hold: {family: "policy", reason}}`; the bridge carries
+  the verdict in the call proof and the TARGET app holds the call in its own holds table (`heldBy` = `rules/rules_gate`).
+  The owner decides there; the retry of the same input runs once; a refusal on the retry still wins. If the hook-answer
+  validator ever refused a policy hold, Rules would refuse instead (fail closed).
 - **Context (`rules_context`):** `rules.narrowing` v1 `{v, ruleId, reason, memoryTags {anyOf, noneOf}}` (Knowledge
   reads it), `rules.matched`, `rules.onBehalfOf`.
 - **After (`rules_filter`, reads):** redacts result objects whose `tags[]` fail the narrowing.
 - **On behalf of:** the bridge copies the runner's claim into `tb.onBehalfOf` (unverified). Rules resolves it to Fleet
   teams; a claim can only make a decision stricter, never wider (C82).
-- **Fleet read model (C81 G2):** Fleet `directory_get` through the companion grant, outside calls: every 60 s once the
-  SDK offers background companion calls (C85, feature check), and from owner pages when older than 60 s. No Fleet =
-  no teams.
+- **Fleet read model (C81 G2):** Fleet `directory_get` (`sinceRevision`) through the companion grant, never inside a
+  hook: at start and every 60 s with an app-initiated call (C85), on agent-list changes, and from owner pages when
+  older than 60 s. No Fleet = no teams.
+- **Badge:** pending English drafts count toward the app's `pendingHolds` (TBD badge, C86).
 - **English rules (C84):** the owner's own agent translates and calls `rule_draft_submit` (a draft only); the owner
   approves it on the Drafts page. Rules never calls a model.
 

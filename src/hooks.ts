@@ -2,15 +2,19 @@
 // (manifest `match`); the SDK route checks the hook proof and the timeout. Each handler decides from Rules' own
 // cached tables only: no app call (G3), no model call, no network. Every error refuses (fail closed).
 import { performance } from "node:perf_hooks";
-import { HOLD_FAMILIES } from "@opt2-tealbrick/manifest";
+import { hookResponseProblem } from "@opt2-tealbrick/manifest";
 import type { Db, HookContext, HookHandler, HookRequest, Json } from "@opt2-tealbrick/miniapp-sdk";
 import { type CallFacts, type Claim, claimKey, evaluate, recorded, redactionsFor, type Verdict } from "./engine.ts";
 import { fleetIndex, liveRules, recordDecision } from "./store.ts";
 
 /** Rules' own answer budget, far below the bridge's 2 s hook limit: slower → refuse. */
 export const GATE_BUDGET_MS = 250;
-/** Spec 0.1.13 (G1): a before hook may answer hold with family `policy`. Feature check on the spec vocabulary. */
-export const HOLD_SUPPORTED = (HOLD_FAMILIES as readonly string[]).includes("policy");
+/**
+ * Spec 0.1.13 (G1): a before hook may answer hold with family `policy`. Feature check with the ONE hook-answer
+ * validator (manifest 0.1.8, the same the SDK route and the bridge use): if it refused a policy hold, Rules would
+ * fall back to refusing (fail closed) instead of sending an answer the SDK would turn into hook_failed.
+ */
+export const HOLD_SUPPORTED = hookResponseProblem("before", { allow: false, hold: { family: "policy", reason: "probe" } }, "rules") === null;
 export const REASON_MAX = 280;
 export const FAIL_CLOSED = "Rules could not decide this call in time, so it is refused (fail closed).";
 
@@ -22,7 +26,7 @@ export function claimOf(context: Record<string, unknown>): { claim: Claim | null
   const o = context["tb.onBehalfOf"];
   if (!isObj(o) || !isObj(o.claim)) return { claim: null, verified: false };
   const { kind, id } = o.claim;
-  if ((kind !== "person" && kind !== "agent" && kind !== "channel_sender") || typeof id !== "string" || id.length === 0 || id.length > 200) return { claim: null, verified: false };
+  if ((kind !== "person" && kind !== "agent" && kind !== "channel_sender") || typeof id !== "string" || id.length === 0 || id.length > 256) return { claim: null, verified: false };
   return { claim: { kind, id }, verified: o.verified === true };
 }
 

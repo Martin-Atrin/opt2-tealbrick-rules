@@ -128,7 +128,7 @@ test("preview: dry run with an unsaved candidate and per-rule steps", async () =
   assert.equal(free.decision, "allow");
   const cand = await run(OP.rulesPreview)({ call, candidate: spec({ title: "candidate", priority: 1, decision: "hold", reason: "review" }) }, owner);
   assert.equal(cand.ruleId, "candidate");
-  assert.equal(cand.answered, "deny", "hold is refused until spec 0.1.13");
+  assert.equal(cand.answered, "hold", "spec 0.1.13: a hold rule holds");
   assert.equal(cand.steps.length, 2);
 });
 
@@ -193,4 +193,24 @@ test("Fleet read model: parse, departed people dropped, unchanged keeps, absent 
   assert.equal(fleetTeams(db).length, 0, "no Fleet → teams are empty");
   const st = await run(OP.fleetStatus)({}, opCtx(db, { type: "person", id: OWNER }, callApp as unknown as OpContext["callApp"]));
   assert.equal(st.source, "none");
+});
+
+test("background: onStart runs the Fleet read model with the app-initiated callApp (C85); agentsChanged refreshes; pending drafts count", async () => {
+  const { db } = migratedDb();
+  let calls = 0;
+  const callApp = async () => {
+    calls++;
+    return { status: "ok" as const, output: DIRECTORY };
+  };
+  const quiet = { debug() {}, info() {}, warn() {}, error() {} };
+  await definition.onStart?.({ db, log: quiet, callApp, statusChanged() {} } as never);
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(calls, 1, "onStart syncs at once (then every 60 s)");
+  assert.deepEqual(fleetIndex(db).get(`agent:${AGENT_A}`), ["tm_x"]);
+  await definition.events?.agentsChanged?.([], { db, log: quiet, callApp, statusChanged() {} } as never);
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(calls, 2, "a changed agent list refreshes the copy");
+  assert.equal(await definition.pendingCount?.(db), 0);
+  await run(OP.ruleDraftSubmit)({ text: "x", rules: [spec({})] }, opCtx(db, { type: "agent", id: AGENT_A }));
+  assert.equal(await definition.pendingCount?.(db), 1, "a pending draft counts toward pendingHolds (TBD badge)");
 });

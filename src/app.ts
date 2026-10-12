@@ -45,6 +45,7 @@ import {
   listRules,
   liveRules,
   markFleetStale,
+  pendingDraftCount,
   saveRule,
   submitDraft,
 } from "./store.ts";
@@ -145,7 +146,9 @@ export const handlers = {
   }),
   [OP.draftDecide]: op<DraftDecideInput, DraftDecideOutput>({
     async run(input, ctx) {
-      return { draft: decideDraft(ctx.db, { id: input.id, decision: input.decision, actor: person(ctx) }) };
+      const draft = decideDraft(ctx.db, { id: input.id, decision: input.decision, actor: person(ctx) });
+      ctx.statusChanged();
+      return { draft };
     },
   }),
   [OP.fleetStatus]: op<FleetStatusInput, FleetStatusOutput>({
@@ -188,6 +191,7 @@ export const handlers = {
     async run(input, ctx) {
       const d = submitDraft(ctx.db, { text: input.text, note: input.note, rules: input.rules, by: { type: ctx.caller.type, id: ctx.caller.id, name: ctx.caller.name } });
       ctx.receipt.meta({ draftId: d.id });
+      ctx.statusChanged();
       return { draftId: d.id, status: "pending" as const };
     },
   }),
@@ -195,32 +199,25 @@ export const handlers = {
 
 export const hooks = makeHooks(manifest.id);
 
-/** Set once the SDK offers background companion calls (C85); agent events then refresh at once. */
-let backgroundCallApp: CallApp | null = null;
-
 export const definition: SdkAppDefinition = {
   manifest,
   handlers,
   hooks,
   migrations: migrationsDir,
   events: {
-    // A changed agent list may change Fleet's teams: mark the copy stale; refresh now when background calls exist.
-    async agentAdded(_agent, ctx) {
+    // A changed agent list may change Fleet's teams: mark the copy stale and refresh now (app-initiated call, C85).
+    async agentsChanged(_agents, ctx) {
       markFleetStale(ctx.db);
-      if (backgroundCallApp) void syncFleet(ctx.db, backgroundCallApp);
-    },
-    async agentRemoved(_agent, ctx) {
-      markFleetStale(ctx.db);
-      if (backgroundCallApp) void syncFleet(ctx.db, backgroundCallApp);
+      void syncFleet(ctx.db, ctx.callApp as CallApp);
     },
   },
+  // Pending English drafts count toward the app's pendingHolds (TBD badge, C86).
+  async pendingCount(db) {
+    return pendingDraftCount(db);
+  },
+  // Fleet read model: refresh now and every 60 s with an app-initiated companion call (C85), never inside a hook.
   async onStart(ctx) {
-    // Feature check (C85, spec 0.1.13): StartContext.callApp → 60 s Fleet refresh outside any call.
-    const callApp = (ctx as unknown as { callApp?: CallApp }).callApp;
-    if (typeof callApp === "function") {
-      backgroundCallApp = callApp;
-      startFleetTimer(ctx.db, callApp);
-    } else ctx.log.info("fleet read model refreshes from owner pages until the SDK offers background companion calls (C85)");
+    startFleetTimer(ctx.db, ctx.callApp as CallApp);
   },
 };
 
