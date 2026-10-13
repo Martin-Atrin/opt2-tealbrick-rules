@@ -22,7 +22,7 @@ Rules never calls a model. When the owner asks you to set a rule in plain Englis
 
 A structured rule has:
 - `title`, `priority` (0..1000, lower runs first; the first matching rule decides), `active`.
-- `match` (all named criteria must match; an empty list means any): `agents` (caller ids), `modes` (`free`, `bound`), `products`, `operations` (needs `products`), `effects` (`read`, `write`, `outward`, `destructive`, `money`), `onBehalfOf` (`teams` = Fleet team ids, `ids` = person ids or handles such as `slack:U123`, `kinds`).
+- `match` (all named criteria must match; an empty list means any): `agents` (caller ids), `modes` (`free`, `bound`), `products`, `operations` (needs `products`; the app's MANIFEST operation ids, never MCP tool names: Connect's `connect__tools_call` / `tools_search` tools are operation `tools`; a rule naming an operation the app does not declare is refused because it would never match), `effects` (`read`, `write`, `outward`, `destructive`, `money`), `onBehalfOf` (`teams` = Fleet team ids, `ids` = person ids or handles such as `slack:U123`, `kinds`).
 - `outcome`: `decision` (`allow`, `deny`, `hold`) and `reason` (shown to agents, max 280 characters).
 - `narrowing` (only with `allow`): `memoryTags.anyOf` (only memories with one of these tags) and `memoryTags.noneOf` (never memories with these tags).
 

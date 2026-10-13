@@ -30,15 +30,18 @@ import {
   type RulesSetInput,
   type RulesSetOutput,
 } from "#kit";
-import { type CallFacts, claimKey, evaluate, explain, order, type Rule, specProblem } from "./engine.ts";
+import { catalogOf, catalogState, ensureCatalog, opTitles, type SyncOptions, startCatalogTimer } from "./catalog.ts";
+import { type CallFacts, claimKey, evaluate, explain, order, type Rule, type RuleSpec } from "./engine.ts";
 import { type CallApp, refreshIfStale, startFleetTimer, syncFleet } from "./fleet.ts";
 import { gateAnswer, HOLD_SUPPORTED, makeHooks } from "./hooks.ts";
 import {
+  type DraftView,
   decideDraft,
   deleteRule,
   fleetIndex,
   fleetState,
   fleetTeams,
+  getDraft,
   getRule,
   listDecisions,
   listDrafts,
@@ -46,6 +49,7 @@ import {
   liveRules,
   markFleetStale,
   pendingDraftCount,
+  ruleProblem,
   saveRule,
   submitDraft,
 } from "./store.ts";
@@ -78,11 +82,32 @@ async function freshFleet(ctx: OpContext, force = false): Promise<void> {
   }
 }
 
+/** Catalog read before a write that names apps or operations (bounded wait; see ensureCatalog). */
+async function catalogFor(ctx: OpContext, specs: readonly RuleSpec[]): Promise<void> {
+  await ensureCatalog(ctx.db, specs, catalogOpts(ctx.log));
+}
+
+const catalogOpts = (log: OpContext["log"]): SyncOptions => ({ log: { warn: (msg, data) => log.warn(msg, data as never) } });
+
+/** Review data for a draft: per rule why it can never match (null = fine), and each named operation's manifest title. */
+function reviewed(ctx: OpContext, d: DraftView): DraftView & { problems: (string | null)[]; opTitles: Record<string, string> } {
+  return { ...d, problems: d.rules.map((s) => ruleProblem(ctx.db, s) || null), opTitles: opTitles(d.rules, catalogOf(ctx.db)) };
+}
+
 export const handlers = {
   [OP.rulesList]: op<RulesListInput, RulesListOutput>({
     async run(input, ctx) {
       person(ctx);
-      return { rules: listRules(ctx.db, input.includeDeleted ?? false), holdSupported: HOLD_SUPPORTED, defaultDecision: "allow" };
+      const rules = listRules(ctx.db, input.includeDeleted ?? false);
+      await catalogFor(ctx, rules.map((r) => r.spec));
+      const st = catalogState(ctx.db);
+      return {
+        // Stored rules that can never match stay (never deleted) and are flagged; the gate simply never matches them.
+        rules: rules.map((r) => ({ ...r, problem: ruleProblem(ctx.db, r.spec) || null })),
+        holdSupported: HOLD_SUPPORTED,
+        defaultDecision: "allow",
+        catalog: { generatedAt: st.generatedAt, syncedAt: st.syncedAt == null ? null : new Date(st.syncedAt).toISOString(), error: st.error, products: catalogOf(ctx.db)?.size ?? 0 },
+      };
     },
   }),
   [OP.rulesGet]: op<RulesGetInput, RulesGetOutput>({
@@ -94,6 +119,7 @@ export const handlers = {
   [OP.rulesSet]: op<RulesSetInput, RulesSetOutput>({
     async run(input, ctx) {
       const actor = person(ctx);
+      await catalogFor(ctx, [input.rule]);
       return { rule: saveRule(ctx.db, { id: input.id, expectedRev: input.expectedRev, spec: input.rule, actor }) };
     },
   }),
@@ -107,7 +133,8 @@ export const handlers = {
       person(ctx);
       await freshFleet(ctx);
       if (input.candidate) {
-        const p = specProblem(input.candidate);
+        await catalogFor(ctx, [input.candidate]);
+        const p = ruleProblem(ctx.db, input.candidate);
         if (p) throw new TbError("input_invalid", p, 400);
       }
       const rules: Rule[] = order([...liveRules(ctx.db), ...(input.candidate ? [{ id: "candidate", rev: 0, spec: input.candidate, updatedAt: Date.now() }] : [])]);
@@ -141,14 +168,18 @@ export const handlers = {
   [OP.draftsList]: op<DraftsListInput, DraftsListOutput>({
     async run(input, ctx) {
       person(ctx);
-      return { drafts: listDrafts(ctx.db, input.status, input.limit ?? 50) };
+      const drafts = listDrafts(ctx.db, input.status, input.limit ?? 50);
+      await catalogFor(ctx, drafts.filter((d) => d.status === "pending").flatMap((d) => d.rules));
+      return { drafts: drafts.map((d) => reviewed(ctx, d)) };
     },
   }),
   [OP.draftDecide]: op<DraftDecideInput, DraftDecideOutput>({
     async run(input, ctx) {
-      const draft = decideDraft(ctx.db, { id: input.id, decision: input.decision, actor: person(ctx) });
+      const actor = person(ctx);
+      if (input.decision === "approve") await catalogFor(ctx, getDraft(ctx.db, input.id)?.rules ?? []);
+      const draft = decideDraft(ctx.db, { id: input.id, decision: input.decision, actor });
       ctx.statusChanged();
-      return { draft };
+      return { draft: reviewed(ctx, draft) };
     },
   }),
   [OP.fleetStatus]: op<FleetStatusInput, FleetStatusOutput>({
@@ -189,6 +220,7 @@ export const handlers = {
     // Creates a DRAFT only; the owner approves it in the UI (C84). Rules itself never calls a model.
     redact: (input) => `rule draft (${input.rules.length} rule${input.rules.length === 1 ? "" : "s"}): ${input.text.slice(0, 200)}`,
     async run(input, ctx) {
+      await catalogFor(ctx, input.rules);
       const d = submitDraft(ctx.db, { text: input.text, note: input.note, rules: input.rules, by: { type: ctx.caller.type, id: ctx.caller.id, name: ctx.caller.name } });
       ctx.receipt.meta({ draftId: d.id });
       ctx.statusChanged();
@@ -218,6 +250,8 @@ export const definition: SdkAppDefinition = {
   // Fleet read model: refresh now and every 60 s with an app-initiated companion call (C85), never inside a hook.
   async onStart(ctx) {
     startFleetTimer(ctx.db, ctx.callApp as CallApp);
+    // App catalog from the signed release index (writer checks only; the gate never reads it).
+    startCatalogTimer(ctx.db, catalogOpts(ctx.log));
   },
 };
 

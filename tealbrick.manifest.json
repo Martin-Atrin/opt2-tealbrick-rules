@@ -4,7 +4,7 @@
   "id": "rules",
   "name": "Rules and Approvals",
   "summary": "Rules and Approvals is the workspace policy: it allows, refuses or holds other apps' calls, always with a recorded reason.",
-  "version": "0.2.6",
+  "version": "0.2.7",
   "sdkMajor": 1,
   "requires": {
     "bridge": "0.1.17"
@@ -89,7 +89,8 @@
         "required": [
           "rules",
           "holdSupported",
-          "defaultDecision"
+          "defaultDecision",
+          "catalog"
         ],
         "properties": {
           "rules": {
@@ -104,6 +105,41 @@
           },
           "defaultDecision": {
             "const": "allow"
+          },
+          "catalog": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "generatedAt",
+              "syncedAt",
+              "error",
+              "products"
+            ],
+            "properties": {
+              "generatedAt": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "syncedAt": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "error": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "maxLength": 300
+              },
+              "products": {
+                "type": "integer",
+                "minimum": 0
+              }
+            }
           }
         },
         "$defs": {
@@ -116,7 +152,8 @@
               "spec",
               "source",
               "createdAt",
-              "updatedAt"
+              "updatedAt",
+              "problem"
             ],
             "properties": {
               "id": {
@@ -136,6 +173,13 @@
               },
               "updatedAt": {
                 "type": "string"
+              },
+              "problem": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "maxLength": 600
               }
             }
           },
@@ -1861,6 +1905,25 @@
                 "items": {
                   "type": "string"
                 }
+              },
+              "problems": {
+                "type": "array",
+                "maxItems": 10,
+                "items": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "maxLength": 600
+                }
+              },
+              "opTitles": {
+                "type": "object",
+                "maxProperties": 500,
+                "additionalProperties": {
+                  "type": "string",
+                  "maxLength": 200
+                }
               }
             }
           },
@@ -2171,6 +2234,25 @@
                 "maxItems": 10,
                 "items": {
                   "type": "string"
+                }
+              },
+              "problems": {
+                "type": "array",
+                "maxItems": 10,
+                "items": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "maxLength": 600
+                }
+              },
+              "opTitles": {
+                "type": "object",
+                "maxProperties": 500,
+                "additionalProperties": {
+                  "type": "string",
+                  "maxLength": 200
                 }
               }
             }

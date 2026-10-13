@@ -309,6 +309,16 @@ export function RulesPage() {
           {error}
         </Notice>
       ) : null}
+      {data?.rules.some((r) => r.problem) ? (
+        <Notice tone="action" role="alert">
+          {data.rules.filter((r) => r.problem).length} rule(s) never match: they name an app or operation that the app does not declare. Edit or delete them; until then they protect nothing.
+        </Notice>
+      ) : null}
+      {data?.catalog.error ? (
+        <p style={muted}>
+          App catalog: last read failed ({data.catalog.error}); rules are checked against the catalog of {when(data.catalog.syncedAt)}.
+        </p>
+      ) : null}
       {!data ? <p>Loading rules.</p> : data.rules.length === 0 ? <p>No rules yet. Every call is allowed (within each app's own limits).</p> : null}
       <ul style={ul}>
         {data?.rules.map((r) => (
@@ -319,7 +329,9 @@ export function RulesPage() {
               <Tag>priority {r.spec.priority}</Tag>
               {r.spec.active ? null : <Tag tone="neutral">inactive</Tag>}
               {r.source.startsWith("drf_") ? <Tag tone="progress">from draft</Tag> : null}
+              {r.problem ? <Tag tone="blocked">never matches</Tag> : null}
             </div>
+            {r.problem ? <p style={muted}>Never matches: {r.problem}</p> : null}
             <p style={muted}>
               {matchText(r.spec, teamName, agentName)} → {r.spec.outcome.reason}
               {r.spec.narrowing?.memoryTags ? ` · memories: ${JSON.stringify(r.spec.narrowing.memoryTags)}` : ""}
@@ -393,19 +405,24 @@ export function DraftsPage({ onChange }: { onChange: () => void }) {
             <blockquote style={{ margin: "0.5rem 0", overflowWrap: "anywhere" }}>“{d.text}”</blockquote>
             {d.note ? <p style={muted}>Agent note: {d.note}</p> : null}
             <ol>
-              {d.rules.map((r) => (
+              {d.rules.map((r, i) => (
                 <li key={JSON.stringify(r)}>
                   <strong>{r.title}</strong> <Tag tone={DECISION_TONE[r.outcome.decision]}>{r.outcome.decision}</Tag> <Tag>priority {r.priority}</Tag>
+                  {d.problems?.[i] ? <Tag tone="blocked">never matches</Tag> : null}
                   <div style={muted}>
-                    {matchText(r, teamName, agentName)} → {r.outcome.reason}
+                    {matchText(r, teamName, agentName, d.opTitles ?? {})} → {r.outcome.reason}
                     {r.narrowing?.memoryTags ? ` · memories: ${JSON.stringify(r.narrowing.memoryTags)}` : ""}
                   </div>
+                  {d.problems?.[i] ? <div style={muted}>Never matches: {d.problems[i]}</div> : null}
                 </li>
               ))}
             </ol>
+            {d.status === "pending" && d.problems?.some(Boolean) ? (
+              <Notice tone="action">This draft cannot be applied: a rule in it would never match, so it would protect nothing. Reject it and ask the agent for a corrected draft.</Notice>
+            ) : null}
             {d.status === "pending" ? (
               <div style={row}>
-                <Button variant="primary" onClick={() => void decide(d, "approve")}>
+                <Button variant="primary" disabled={d.problems?.some(Boolean)} onClick={() => void decide(d, "approve")}>
                   Approve and apply
                 </Button>
                 <Button onClick={() => void decide(d, "reject")}>Reject</Button>

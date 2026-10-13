@@ -6,6 +6,9 @@ import type { Db, HookContext, HookRequest, Json, OpContext } from "@opt2-tealbr
 import { migrationsDir } from "../src/app.ts";
 import type { RuleSpec } from "../src/engine.ts";
 
+// Booted apps in unit tests never read the real release index (catalog tests use a signed fake index).
+process.env.TB_RULES_CATALOG_OFF = "1";
+
 export const AGENT_A = "agt_01J0000000000000000000000A";
 export const AGENT_B = "agt_01J0000000000000000000000B";
 export const OWNER = "per_01J00000000000000000000OWN";

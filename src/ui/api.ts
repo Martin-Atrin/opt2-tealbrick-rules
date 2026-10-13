@@ -38,17 +38,24 @@ export function emptySpec(): RuleSpec {
 }
 
 /** One line that says what a rule matches, for lists. */
-export function matchText(s: RuleSpec, teamName: (id: string) => string, agentName: (id: string) => string): string {
+export function matchText(s: RuleSpec, teamName: (id: string) => string, agentName: (id: string) => string, titles?: Record<string, string>): string {
   const m = s.match;
   const parts: string[] = [];
   if (m.agents?.length) parts.push(`callers ${m.agents.map(agentName).join(", ")}`);
   if (m.modes?.length) parts.push(`${m.modes.join("/")} agents`);
   if (m.products?.length) parts.push(`apps ${m.products.join(", ")}`);
-  if (m.operations?.length) parts.push(`operations ${m.operations.join(", ")}`);
+  if (m.operations?.length) parts.push(`operations ${m.operations.map((op) => opLabel(op, m.products ?? [], titles)).join(", ")}`);
   if (m.effects?.length) parts.push(`effects ${m.effects.join(", ")}`);
   const o = m.onBehalfOf;
   if (o?.teams?.length) parts.push(`on behalf of team ${o.teams.map(teamName).join(", ")}`);
   if (o?.ids?.length) parts.push(`on behalf of ${o.ids.join(", ")}`);
   if (o?.kinds?.length) parts.push(`requester kind ${o.kinds.join(", ")}`);
   return parts.length ? parts.join("; ") : "every call";
+}
+
+/** "tools (“Connected service tools”)": the op id with its manifest title from the catalog, or "(not declared)". */
+export function opLabel(op: string, products: readonly string[], titles: Record<string, string> | undefined): string {
+  if (!titles) return op;
+  const t = products.map((p) => titles[`${p}.${op}`]).find(Boolean);
+  return t ? `${op} (“${t}”)` : `${op} (not declared by the app)`;
 }

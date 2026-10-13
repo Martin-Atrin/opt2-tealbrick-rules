@@ -3,6 +3,7 @@
 // write here invalidates, so a hook call does no query except the trace insert.
 import { ulid } from "@opt2-tealbrick/manifest";
 import { type Db, TbError } from "@opt2-tealbrick/miniapp-sdk";
+import { CATALOG_MISSING, catalogOf, catalogProblem } from "./catalog.ts";
 import { type CallFacts, type Decision, order, type Rule, type RuleSpec, specProblem } from "./engine.ts";
 
 /** At most this many live rules (a gate evaluates all of them on every call). */
@@ -72,14 +73,21 @@ export function getRule(db: Db, id: string): { rule: RuleView; deleted: boolean;
   return { rule: ruleView(row), deleted: Number(row.deleted) === 1, revisions };
 }
 
-function checkSpec(spec: RuleSpec): void {
-  const p = specProblem(spec);
-  if (p) throw new TbError("input_invalid", p, 400);
+/** Why a stored or submitted spec is unusable ("" = fine): schema-free checks, then the app catalog (never matches). */
+export function ruleProblem(db: Db, spec: RuleSpec): string {
+  return specProblem(spec) || catalogProblem(spec, catalogOf(db));
+}
+
+/** Writer strict (L24): refuse a spec with a problem. `label` prefixes the message (drafts name the rule). */
+function checkSpec(db: Db, spec: RuleSpec, label = ""): void {
+  const p = ruleProblem(db, spec);
+  if (p === CATALOG_MISSING) throw new TbError("catalog_unavailable", p, 503);
+  if (p) throw new TbError("input_invalid", `${label}${p}`, 400);
 }
 
 /** Create (no id) or update (id + optional expectedRev). Writes a revision row. */
 export function saveRule(db: Db, input: { id?: string; expectedRev?: number; spec: RuleSpec; actor: string; source?: string }, now = Date.now()): RuleView {
-  checkSpec(input.spec);
+  checkSpec(db, input.spec);
   const out = db.transaction(() => {
     if (!input.id) {
       const live = Number(db.prepare("SELECT COUNT(*) AS n FROM rules WHERE deleted = 0").get()?.n ?? 0);
@@ -148,7 +156,9 @@ function draftView(r: Record<string, unknown>): DraftView {
 }
 
 export function submitDraft(db: Db, input: { text: string; note?: string; rules: RuleSpec[]; by: { type: string; id: string; name: string } }, now = Date.now()): DraftView {
-  for (const spec of input.rules) checkSpec(spec);
+  input.rules.forEach((spec, i) => {
+    checkSpec(db, spec, `rule ${i + 1} (“${spec.title}”): `);
+  });
   const pending = Number(db.prepare("SELECT COUNT(*) AS n FROM drafts WHERE status = 'pending' AND submitted_by_id = ?").get(input.by.id)?.n ?? 0);
   if (pending >= MAX_PENDING_DRAFTS) throw new TbError("too_many_drafts", `at most ${MAX_PENDING_DRAFTS} pending drafts per agent; ask the owner to review them`, 429);
   const id = `drf_${ulid(now)}`;
@@ -156,6 +166,11 @@ export function submitDraft(db: Db, input: { text: string; note?: string; rules:
     "INSERT INTO drafts (id, status, text, note, rules, submitted_by_type, submitted_by_id, submitted_by_name, submitted_at) VALUES (?, 'pending', ?, ?, ?, ?, ?, ?, ?)",
   ).run(id, input.text, input.note ?? "", JSON.stringify(input.rules), input.by.type, input.by.id, input.by.name.slice(0, 120), now);
   return draftView(db.prepare("SELECT * FROM drafts WHERE id = ?").get(id) as Record<string, unknown>);
+}
+
+export function getDraft(db: Db, id: string): DraftView | null {
+  const row = db.prepare("SELECT * FROM drafts WHERE id = ?").get(id);
+  return row ? draftView(row) : null;
 }
 
 export function pendingDraftCount(db: Db): number {
@@ -176,6 +191,12 @@ export function decideDraft(db: Db, input: { id: string; decision: "approve" | "
   if (String(row.status) !== "pending") throw new TbError("draft_decided", `this draft is already ${String(row.status)}`, 409);
   const ruleIds: string[] = [];
   if (input.decision === "approve") {
+    // A draft whose rule could never match is not applied (it would look like protection and protect nothing, L3).
+    json<RuleSpec[]>(row.rules, []).forEach((spec, i) => {
+      const p = ruleProblem(db, spec);
+      if (p === CATALOG_MISSING) throw new TbError("catalog_unavailable", p, 503);
+      if (p) throw new TbError("draft_never_matches", `This draft cannot be applied: rule ${i + 1} (“${spec.title}”): ${p}. Reject it and ask the agent for a corrected draft.`, 409);
+    });
     const live = Number(db.prepare("SELECT COUNT(*) AS n FROM rules WHERE deleted = 0").get()?.n ?? 0);
     if (live + json<RuleSpec[]>(row.rules, []).length > MAX_RULES) throw new TbError("too_many_rules", `at most ${MAX_RULES} rules; delete some first`, 409);
     for (const spec of json<RuleSpec[]>(row.rules, [])) ruleIds.push(saveRule(db, { spec, actor: input.actor, source: input.id }, now).id);

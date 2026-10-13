@@ -49,6 +49,15 @@ operation id (`src/app.ts`) and plain migrations (`migrations/`).
   older than 60 s. Fail safe (A2A-9): a refusal (no grant, not found, unlicensed, any 4xx) clears the copy at once;
   a transient failure (5xx, timeout) keeps it only while the last successful read is ≤ 10 min old. No Fleet = no teams.
 - **Badge:** pending English drafts count toward the app's `pendingHolds` (TBD badge, C86).
+- **App catalog (0.2.7, writer strict L24):** at start and every 6 h (every minute after a failure) Rules reads the
+  SIGNED release index Core reads (Platform `registry` release; JWS verified with the pinned release key =
+  platform `registry/keys.json`; each manifest checked against `manifestDigest` and `validateManifest`). Every writer
+  (owner rule create/update, dry-run candidate, `rule_draft_submit`, draft apply) refuses a rule that can never match:
+  an unknown app, an operation a named app does not declare (an MCP tool name such as `tools_call` gets "did you mean
+  `tools`"), an owner-only (person) op, or an effect the named op never has (dynamic ops excepted: the bridge sends the
+  resolved effect). Without any catalog yet, a rule that names apps is refused with `catalog_unavailable` (503).
+  Stored rules and drafts are never deleted: the Rules page flags them "never matches", and such a draft cannot be
+  applied (`draft_never_matches`, 409). The gate never reads the catalog. Unit tests set `TB_RULES_CATALOG_OFF=1`.
 - **English rules (C84):** the owner's own agent translates and calls `rule_draft_submit` (a draft only); the owner
   approves it on the Drafts page. Rules never calls a model.
 
