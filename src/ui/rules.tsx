@@ -211,7 +211,7 @@ function Preview({ candidate, dir }: { candidate?: RuleSpec; dir: Directory }) {
           {result.decision === "hold" && result.answered === "deny" ? (
             <p className="tb-soft">Holds from rules arrive with the next platform release. Until then a hold rule refuses.</p>
           ) : null}
-          <ol className="rules-trace">
+          <ol className="rules-trace tb-list">
             {result.steps.map((st) => (
               <li key={st.ruleId}>
                 <strong>{st.title}</strong>: {st.why}

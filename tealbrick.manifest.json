@@ -2,9 +2,9 @@
   "$schema": "https://spec.opt2.tealbrick.com/manifest.schema.json",
   "schema": "tealbrick.miniapp/2",
   "id": "rules",
-  "name": "Rules and Approvals",
-  "summary": "Rules and Approvals is the workspace policy: it allows, refuses or holds other apps' calls, always with a recorded reason.",
-  "version": "0.2.9",
+  "name": "Rules & Approvals",
+  "summary": "Rules & Approvals is the workspace policy: it allows, refuses or holds other apps' calls, always with a recorded reason.",
+  "version": "0.2.10",
   "sdkMajor": 1,
   "requires": {
     "bridge": "0.1.17"

@@ -12,6 +12,6 @@
 .rules-group { display: grid; gap: var(--tb-s4); padding-top: var(--tb-s4); box-shadow: var(--tb-hair-top); }
 .rules-group h3, .rules-preview h3 { font-size: var(--tb-text-title); }
 .rules-preview { display: grid; gap: var(--tb-s4); align-content: start; }
-.rules-trace { display: grid; gap: var(--tb-s2); margin: 0; padding-left: var(--tb-s5); color: var(--tb-ink-soft); font-size: var(--tb-text-label); }
+.rules-trace { display: grid; gap: var(--tb-s1); margin: 0; color: var(--tb-ink-soft); font-size: var(--tb-text-label); }
 .rules-show { width: 200px; }
 @media (max-width: 720px) { .rules-show { width: 100%; } }
