@@ -4,7 +4,7 @@
   "id": "rules",
   "name": "Rules and Approvals",
   "summary": "Rules and Approvals is the workspace policy: it allows, refuses or holds other apps' calls, always with a recorded reason.",
-  "version": "0.2.7",
+  "version": "0.2.8",
   "sdkMajor": 1,
   "requires": {
     "bridge": "0.1.17"
@@ -14,7 +14,7 @@
   },
   "source": {
     "repo": "https://github.com/Martin-Atrin/opt2-tealbrick-rules",
-    "license": "MIT"
+    "license": "Apache-2.0"
   },
   "icon": {
     "svgPath": "M12 3l8 3v6c0 4.5-3.4 8.3-8 9-4.6-.7-8-4.5-8-9V6z M8.5 12l2.5 2.5 4.5-5",

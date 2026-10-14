@@ -15,13 +15,25 @@ export function run<K extends keyof PersonOps>(op: K, input: In<K>): Promise<Out
 }
 
 export const EFFECTS = ["read", "write", "outward", "destructive", "money"] as const;
-export const DECISION_TONE = { allow: "ok", deny: "blocked", hold: "action", narrow: "progress", redact: "progress" } as const;
+/** Status pill of a decision (allow = live, refuse = needs you, hold = busy). */
+export const DECISION_STATUS = { allow: "live", deny: "needs-you", hold: "busy", narrow: "live", redact: "live" } as const;
+/** What a rule's decision is called in the rule list and the editor. */
+export const DECISION_LABEL = { allow: "Allow", deny: "Refuse", hold: "Hold for my review" } as const;
 
+const SIGNED_OUT = "You’re signed out. Open this app from Portal to sign in again.";
+const GENERIC = "Something went wrong. Try again in a moment.";
+/** The app’s own refusals: their text already says what is wrong and what to do (src/store.ts), so it is shown as it is. */
+const OWN_REFUSALS = new Set(["revision_conflict", "input_invalid", "draft_never_matches", "draft_decided", "too_many_rules", "too_many_drafts", "catalog_unavailable", "not_found", "forbidden"]);
+/** Plain sentence for a failed call (RUL-01, RUL-14). Anything that is not the app’s own refusal gets a standard sentence, never raw upstream text. */
 export function errorText(e: unknown): string {
-  return e instanceof Error ? e.message : "something went wrong";
+  const err = (e ?? {}) as { code?: unknown; httpStatus?: unknown; message?: unknown };
+  if (err.code === "session_required" || err.code === "csrf_invalid" || err.httpStatus === 401) return SIGNED_OUT;
+  if (err.code === "network_error") return "Can’t reach the app. Check your connection and try again.";
+  if (typeof err.code === "string" && OWN_REFUSALS.has(err.code) && typeof err.message === "string" && err.message) return err.message;
+  return GENERIC;
 }
 export function when(isoTime: string | null): string {
-  return isoTime ? new Date(isoTime).toLocaleString() : "never";
+  return isoTime ? new Date(isoTime).toLocaleString([], { day: "numeric", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit" }) : "never";
 }
 /** "a, b ,c" → ["a","b","c"]; empty → undefined (= any). */
 export function list(s: string): string[] | undefined {

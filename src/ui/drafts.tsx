@@ -1,0 +1,101 @@
+// Drafts page: rules an agent wrote from English. Nothing applies until the owner approves. A draft with a rule that can
+// never match is badged and cannot be approved (0.2.7). Approve and Reject show their errors (RUL-01), one call at a
+// time per draft.
+import { Button, Card, EmptyState, Notice, Tag } from "@opt2-tealbrick/ui";
+import { useCallback, useRef, useState } from "react";
+import { type DraftRow, errorText, matchText, run, when } from "./api.ts";
+import { DecisionTag, DirectoryErrors, Head, LoadError, Loading, useDirectory, useLoaded } from "./shared.tsx";
+
+const DRAFT_STATUS = { pending: "busy", approved: "live", rejected: "default" } as const;
+
+export function DraftsPage({ onChange }: { onChange: () => void }) {
+  const dir = useDirectory();
+  const load = useCallback(async () => (await run("drafts_list", {})).drafts, []);
+  const { data: drafts, error, loading, reload } = useLoaded(load);
+  const inflight = useRef(new Set<string>());
+  const [busy, setBusy] = useState<readonly string[]>([]);
+  const [failures, setFailures] = useState<Readonly<Record<string, string>>>({});
+  const decide = async (d: DraftRow, decision: "approve" | "reject") => {
+    if (inflight.current.has(d.id)) return;
+    inflight.current.add(d.id);
+    setBusy([...inflight.current]);
+    setFailures(({ [d.id]: _gone, ...rest }) => rest);
+    try {
+      await run("draft_decide", { id: d.id, decision });
+      reload();
+      onChange();
+    } catch (e) {
+      setFailures((f) => ({ ...f, [d.id]: errorText(e) }));
+    } finally {
+      inflight.current.delete(d.id);
+      setBusy([...inflight.current]);
+    }
+  };
+  return (
+    <section className="app-page" aria-label="Drafts">
+      <Head title="Drafts" lede="Ask your agent to write a rule in plain English. It sends its structured version here; nothing applies until you approve it." />
+      {error ? <LoadError message={error} retrying={loading} onRetry={reload} /> : null}
+      <DirectoryErrors dir={dir} />
+      {drafts === null ? (
+        error ? null : <Loading what="drafts" />
+      ) : drafts.length === 0 ? (
+        <EmptyState title="No drafts">When an agent writes a rule for you, it shows up here.</EmptyState>
+      ) : (
+        drafts.map((d) => {
+          const stuck = d.problems?.some(Boolean) ?? false;
+          const working = busy.includes(d.id);
+          return (
+            <Card as="article" className="draft" key={d.id} aria-label={`Draft from ${d.submittedBy.name}`}>
+              <div className="tb-row">
+                <Tag status={DRAFT_STATUS[d.status]}>{d.status}</Tag>
+                <span className="tb-hint">
+                  from {d.submittedBy.name} · {when(d.submittedAt)}
+                </span>
+              </div>
+              <blockquote className="blockq">“{d.text}”</blockquote>
+              {d.note ? <p className="tb-hint">Agent note: {d.note}</p> : null}
+              <ol className="steps-list">
+                {d.rules.map((r, i) => (
+                  <li key={JSON.stringify(r)}>
+                    <b>
+                      {r.title} <DecisionTag decision={r.outcome.decision} rule /> <span className="tb-hint">priority {r.priority}</span>
+                      {d.problems?.[i] ? <Tag status="needs-you">never matches</Tag> : null}
+                    </b>
+                    <span>
+                      {matchText(r, dir.teamName, dir.agentName, d.opTitles ?? {})} → {r.outcome.reason}
+                      {r.narrowing?.memoryTags ? ` · memories: ${JSON.stringify(r.narrowing.memoryTags)}` : ""}
+                    </span>
+                    {d.problems?.[i] ? <span>Never matches: {d.problems[i]}</span> : null}
+                  </li>
+                ))}
+              </ol>
+              {d.status === "pending" && stuck ? (
+                <Notice tone="needs-you">This draft can’t be applied: a rule in it would never match, so it would protect nothing. Reject it and ask the agent for a corrected draft.</Notice>
+              ) : null}
+              {failures[d.id] ? (
+                <Notice tone="needs-you" role="alert">
+                  {failures[d.id]}
+                </Notice>
+              ) : null}
+              {d.status === "pending" ? (
+                <div className="tb-ctas">
+                  <Button variant="primary" disabled={stuck || working} onClick={() => void decide(d, "approve")}>
+                    Approve and apply
+                  </Button>
+                  <Button variant="danger" disabled={working} onClick={() => void decide(d, "reject")}>
+                    Reject
+                  </Button>
+                </div>
+              ) : (
+                <p className="tb-hint">
+                  {d.status} {when(d.decidedAt)}
+                  {d.ruleIds.length ? ` · rules ${d.ruleIds.join(", ")}` : ""}
+                </p>
+              )}
+            </Card>
+          );
+        })
+      )}
+    </section>
+  );
+}
