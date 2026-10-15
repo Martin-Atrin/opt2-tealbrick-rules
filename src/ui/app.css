@@ -1,6 +1,8 @@
 /* Rules & Approvals: page layout that is this app's own (tokens only; the kit and pages.css do the rest). */
 .rules-head { gap: var(--tb-s2); }
-.draft { display: grid; gap: var(--tb-s4); align-content: start; }
+/* card gaps of the mockup: 14px (pending), 10px (decided); no such tokens, so the mean of the neighbours */
+.draft { display: grid; gap: calc((var(--tb-s3) + var(--tb-s4)) / 2); align-content: start; }
+.draft.is-decided { gap: calc((var(--tb-s2) + var(--tb-s3)) / 2); }
 .blockq { margin: 0; padding: 12px 16px; border-radius: var(--tb-radius-brick); background: var(--tb-paper); box-shadow: var(--tb-ring); color: var(--tb-ink-soft); overflow-wrap: anywhere; }
 .steps-list { display: grid; gap: 10px; counter-reset: s; margin: 0; padding: 0; list-style: none; }
 .steps-list li { counter-increment: s; display: grid; grid-template-columns: 32px minmax(0, 1fr); gap: 2px 8px; }
@@ -14,4 +16,6 @@
 .rules-preview { display: grid; gap: var(--tb-s4); align-content: start; }
 .rules-trace { display: grid; gap: var(--tb-s1); margin: 0; color: var(--tb-ink-soft); font-size: var(--tb-text-label); }
 .rules-show { width: 200px; }
-@media (max-width: 720px) { .rules-show { width: 100%; } }
+.toolbar .rules-search { max-width: calc(var(--tb-s10) * 7); } /* 280px, the mockup's search width */
+.rules-intro { max-width: 62ch; }
+.rules-pri { white-space: nowrap; } /* "priority 90" wraps as one unit, as in the mockup */

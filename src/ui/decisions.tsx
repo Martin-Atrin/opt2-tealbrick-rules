@@ -1,8 +1,8 @@
 // Decisions page: the log of what Rules decided (newest first), filtered by call id or by decision.
-import { Button, EmptyState, Notice, SearchIcon, Select, Swatch, Tag, TextInput } from "@opt2-tealbrick/ui";
+import { Button, EmptyState, Field, Notice, SearchIcon, Select, Swatch, Tag, TextInput } from "@opt2-tealbrick/ui";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { type DecisionRow, errorText, run, when } from "./api.ts";
-import { DecisionTag, Head, LoadError, Loading } from "./shared.tsx";
+import { type DecisionRow, errorText, run, shortId, when } from "./api.ts";
+import { DecisionTag, Head, LoadError, Loading, useAgentNames } from "./shared.tsx";
 
 type DecisionFilter = "" | "allow" | "deny" | "hold";
 const SHOW = [
@@ -13,6 +13,7 @@ const SHOW = [
 ];
 
 export function DecisionsPage() {
+  const agentName = useAgentNames();
   const [items, setItems] = useState<DecisionRow[] | null>(null);
   const [cursor, setCursor] = useState<string | null>(null);
   const [filter, setFilter] = useState<{ callId: string; decision: DecisionFilter }>({ callId: "", decision: "" });
@@ -49,12 +50,14 @@ export function DecisionsPage() {
     <section className="app-page" aria-label="Decisions">
       <Head title="Decisions" />
       <div className="toolbar">
-        <div className="tb-search">
+        <div className="tb-search rules-search">
           <SearchIcon />
           <TextInput placeholder="call id" aria-label="call id" value={filter.callId} onChange={(e) => setFilter({ ...filter, callId: e.target.value.trim() })} />
         </div>
         <div className="rules-show">
-          <Select aria-label="Show" value={filter.decision} options={SHOW} onValueChange={(v) => setFilter({ ...filter, decision: v as DecisionFilter })} />
+          <Field label="Show">
+            <Select value={filter.decision} options={SHOW} onValueChange={(v) => setFilter({ ...filter, decision: v as DecisionFilter })} />
+          </Field>
         </div>
       </div>
       {error ? <LoadError message={error} retrying={loading} onRetry={() => load()} /> : null}
@@ -74,10 +77,15 @@ export function DecisionsPage() {
                 {d.reason}
                 {d.ruleTitle ? ` · rule “${d.ruleTitle}” rev ${d.ruleRev}` : ""}
                 {d.onBehalfOf ? ` · on behalf of ${JSON.stringify(d.onBehalfOf)}` : ""}
-                {d.callId ? ` · call ${d.callId}` : ""}
+                {d.callId ? (
+                  <>
+                    {" · call "}
+                    <span title={d.callId}>{shortId(d.callId)}</span>
+                  </>
+                ) : null}
               </p>
               <span className="meta">
-                {d.caller.type} {d.caller.id}
+                {d.caller.type} {d.caller.type === "agent" ? agentName(d.caller.id) : d.caller.id}
                 {d.caller.mode ? ` (${d.caller.mode})` : ""} · {when(d.at)} · {d.phase} · {Math.round(d.durationUs / 100) / 10} ms
               </span>
             </div>

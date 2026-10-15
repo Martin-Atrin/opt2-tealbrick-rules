@@ -21,7 +21,8 @@ export function TeamsPage() {
   useEffect(() => load(false), [load]);
   return (
     <section className="app-page" aria-label="Teams">
-      <Head title="Teams" lede="Rules keeps a copy of your Organization Plane teams so a rule can name a team without asking during a call." />
+      <Head title="Teams" />
+      <p className="tb-soft rules-intro">Rules keeps a copy of your Organization Plane teams so a rule can name a team without asking during a call.</p>
       {error ? <LoadError message={error} retrying={loading} onRetry={() => load(false)} /> : null}
       {st ? (
         <>
@@ -50,7 +51,7 @@ export function TeamsPage() {
                   <Swatch />
                   <h3>{t.name}</h3>
                   <span className="meta">
-                    {plural(t.people, "person", "people")} · {plural(t.agents, "agent", "agents")} · <span className="mono">{t.id}</span>
+                    {plural(t.people, "person", "people")} · {plural(t.agents, "agent", "agents")}
                   </span>
                 </div>
               ))}

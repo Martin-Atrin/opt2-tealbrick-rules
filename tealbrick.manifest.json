@@ -3,8 +3,8 @@
   "schema": "tealbrick.miniapp/2",
   "id": "rules",
   "name": "Rules & Approvals",
-  "summary": "Rules & Approvals is the workspace policy: it allows, refuses or holds other apps' calls, always with a recorded reason.",
-  "version": "0.2.10",
+  "summary": "Rules & Approvals is the workspace policy: it allows, refuses or holds other apps’ calls, always with a recorded reason.",
+  "version": "0.2.11",
   "sdkMajor": 1,
   "requires": {
     "bridge": "0.1.17"
@@ -2450,8 +2450,8 @@
       "effect": "read",
       "idempotency": "none",
       "id": "fleet_status",
-      "title": "Teams from Fleet",
-      "description": "The replicated Fleet teams that rules can name, and when they were last read.",
+      "title": "Teams from Organization Plane",
+      "description": "The replicated Organization Plane teams that rules can name, and when they were last read.",
       "input": {
         "type": "object",
         "additionalProperties": false,
@@ -2923,14 +2923,14 @@
       "crud": [
         "read"
       ],
-      "purpose": "Reads Fleet teams, people and agents so rules can name teams (refreshed outside calls)."
+      "purpose": "Reads Organization Plane teams, people and agents so rules can name teams (refreshed outside calls)."
     }
   ],
   "needsAgentDirectory": true,
   "skills": [
     {
       "id": "use-rules",
-      "title": "How to use Rules and Approvals",
+      "title": "How to use Rules & Approvals",
       "file": "skills/use-rules/SKILL.md"
     }
   ],

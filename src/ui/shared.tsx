@@ -117,6 +117,26 @@ export function DirectoryErrors({ dir }: { dir: Directory }) {
   return <LoadError message={dir.errors.join(" ")} retrying={dir.loading} onRetry={dir.reload} />;
 }
 
+/**
+ * Agent names for rows that store an agent id: one `tb.agents_list` read. If it fails, the ids stay as they are
+ * (quietly; the page never waits for it or blocks on it).
+ */
+export function useAgentNames(): (id: string) => string {
+  const [agents, setAgents] = useState<readonly Agent[]>([]);
+  useEffect(() => {
+    let live = true;
+    callOp<{ agents: Agent[] }>("tb.agents_list", {})
+      .then((r) => {
+        if (live) setAgents(r.agents);
+      })
+      .catch(() => undefined);
+    return () => {
+      live = false;
+    };
+  }, []);
+  return useCallback((id: string) => agents.find((a) => a.id === id)?.name ?? id, [agents]);
+}
+
 // ── multi-choice chips ──────────────────────────────────────────────────────
 
 /** Several-of-many choice drawn as toggle chips (a pill chooses a state). Nothing pressed = any. */

@@ -255,7 +255,8 @@ describe("Rules page", () => {
     OUTPUTS.rules_list = { ...(OUTPUTS.rules_list as object), rules: [{ ...RULE, problem: "app “crm” does not declare operation “export_all”" }] };
     const m = await mount(h(rules.RulesPage));
     assert.match(m.host.textContent ?? "", /1 rule never matches/);
-    assert.match(m.host.querySelector(".item .meta .tb-tag.needs-you")?.textContent ?? "", /never matches/);
+    const tags = [...m.host.querySelectorAll(".item h3 .tb-tag.needs-you")].map((t) => t.textContent ?? "");
+    assert.ok(tags.includes("never matches"), `never matches tag in the rule title, got ${JSON.stringify(tags)}`);
     await m.unmount();
     OUTPUTS.rules_list = { ...(OUTPUTS.rules_list as object), rules: [RULE] };
   });

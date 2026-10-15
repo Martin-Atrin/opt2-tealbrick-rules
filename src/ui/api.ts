@@ -32,8 +32,17 @@ export function errorText(e: unknown): string {
   if (typeof err.code === "string" && OWN_REFUSALS.has(err.code) && typeof err.message === "string" && err.message) return err.message;
   return GENERIC;
 }
+/** Date and time as the approved mockups show it, the same for every owner: "13 Oct 2026, 08:02" (en-GB, 24-hour). */
 export function when(isoTime: string | null): string {
-  return isoTime ? new Date(isoTime).toLocaleString([], { day: "numeric", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit" }) : "never";
+  return isoTime ? new Date(isoTime).toLocaleString("en-GB", { day: "numeric", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit", hourCycle: "h23" }) : "never";
+}
+/** Date only, for list rows: "11 Oct 2026". */
+export function day(isoTime: string | null): string {
+  return isoTime ? new Date(isoTime).toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric" }) : "never";
+}
+/** A long id shortened for reading ("cal_01J9R4…"); the full id goes in a title. */
+export function shortId(id: string): string {
+  return id.length > 12 ? `${id.slice(0, 10)}…` : id;
 }
 /** "a, b ,c" → ["a","b","c"]; empty → undefined (= any). */
 export function list(s: string): string[] | undefined {

@@ -3,7 +3,7 @@
 // time per draft.
 import { Button, Card, EmptyState, Notice, Tag } from "@opt2-tealbrick/ui";
 import { useCallback, useRef, useState } from "react";
-import { type DraftRow, errorText, matchText, run, when } from "./api.ts";
+import { type DraftRow, day, errorText, matchText, run, shortId } from "./api.ts";
 import { DecisionTag, DirectoryErrors, Head, LoadError, Loading, useDirectory, useLoaded } from "./shared.tsx";
 
 const DRAFT_STATUS = { pending: "busy", approved: "live", rejected: "default" } as const;
@@ -45,30 +45,32 @@ export function DraftsPage({ onChange }: { onChange: () => void }) {
           const stuck = d.problems?.some(Boolean) ?? false;
           const working = busy.includes(d.id);
           return (
-            <Card as="article" className="draft" key={d.id} aria-label={`Draft from ${d.submittedBy.name}`}>
+            <Card as="article" className={d.status === "pending" ? "draft" : "draft is-decided"} key={d.id} aria-label={`Draft from ${d.submittedBy.name}`}>
               <div className="tb-row">
                 <Tag status={DRAFT_STATUS[d.status]}>{d.status}</Tag>
                 <span className="tb-hint">
-                  from {d.submittedBy.name} · {when(d.submittedAt)}
+                  from {d.submittedBy.name} · {day(d.submittedAt)}
                 </span>
               </div>
               <blockquote className="blockq">“{d.text}”</blockquote>
               {d.note ? <p className="tb-hint">Agent note: {d.note}</p> : null}
-              <ol className="steps-list">
-                {d.rules.map((r, i) => (
-                  <li key={JSON.stringify(r)}>
-                    <b>
-                      {r.title} <DecisionTag decision={r.outcome.decision} rule /> <span className="tb-hint">priority {r.priority}</span>
-                      {d.problems?.[i] ? <Tag status="needs-you">never matches</Tag> : null}
-                    </b>
-                    <span>
-                      {matchText(r, dir.teamName, dir.agentName, d.opTitles ?? {})} → {r.outcome.reason}
-                      {r.narrowing?.memoryTags ? ` · memories: ${JSON.stringify(r.narrowing.memoryTags)}` : ""}
-                    </span>
-                    {d.problems?.[i] ? <span>Never matches: {d.problems[i]}</span> : null}
-                  </li>
-                ))}
-              </ol>
+              {d.status === "pending" ? (
+                <ol className="steps-list">
+                  {d.rules.map((r, i) => (
+                    <li key={JSON.stringify(r)}>
+                      <b>
+                        {r.title} <DecisionTag decision={r.outcome.decision} rule /> <span className="tb-hint">priority {r.priority}</span>
+                        {d.problems?.[i] ? <Tag status="needs-you">never matches</Tag> : null}
+                      </b>
+                      <span>
+                        {matchText(r, dir.teamName, dir.agentName, d.opTitles ?? {})} → {r.outcome.reason}
+                        {r.narrowing?.memoryTags ? ` · memories: ${JSON.stringify(r.narrowing.memoryTags)}` : ""}
+                      </span>
+                      {d.problems?.[i] ? <span>Never matches: {d.problems[i]}</span> : null}
+                    </li>
+                  ))}
+                </ol>
+              ) : null}
               {d.status === "pending" && stuck ? (
                 <Notice tone="needs-you">This draft can’t be applied: a rule in it would never match, so it would protect nothing. Reject it and ask the agent for a corrected draft.</Notice>
               ) : null}
@@ -88,8 +90,18 @@ export function DraftsPage({ onChange }: { onChange: () => void }) {
                 </div>
               ) : (
                 <p className="tb-hint">
-                  {d.status} {when(d.decidedAt)}
-                  {d.ruleIds.length ? ` · rules ${d.ruleIds.join(", ")}` : ""}
+                  {d.status} {day(d.decidedAt)}
+                  {d.ruleIds.length ? (
+                    <>
+                      {" · rules "}
+                      {d.ruleIds.map((id, i) => (
+                        <span key={id} title={id}>
+                          {i ? ", " : ""}
+                          {shortId(id)}
+                        </span>
+                      ))}
+                    </>
+                  ) : null}
                 </p>
               )}
             </Card>

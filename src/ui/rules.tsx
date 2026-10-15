@@ -2,7 +2,7 @@
 // dry run. Everything goes through person ops; agents can only submit drafts (C84).
 import { Button, Card, Dialog, EmptyState, Field, Notice, Select, Swatch, Switch, Tag, TextInput } from "@opt2-tealbrick/ui";
 import { useCallback, useState } from "react";
-import { EFFECTS, emptySpec, errorText, joinList, list, matchText, type Out, type RuleRow, type RuleSpec, run, when } from "./api.ts";
+import { day, EFFECTS, emptySpec, errorText, joinList, list, matchText, type Out, type RuleRow, type RuleSpec, run, when } from "./api.ts";
 import { ChipChoice, DecisionTag, type Directory, DirectoryErrors, Head, LoadError, Loading, useDirectory, useLoaded } from "./shared.tsx";
 
 const DECISIONS = [
@@ -313,9 +313,12 @@ export function RulesPage() {
         <div className="ruled">
           {data.rules.map((r) => (
             <div className="item" key={r.id}>
-              <Swatch className={r.spec.outcome.decision === "deny" ? "is-needs-you" : undefined} />
+              <Swatch group="control" />
               <h3>
-                {r.spec.title} <DecisionTag decision={r.spec.outcome.decision} rule /> <span className="tb-hint">priority {r.spec.priority}</span>
+                {r.spec.title} <DecisionTag decision={r.spec.outcome.decision} rule /> <span className="tb-hint rules-pri">priority {r.spec.priority}</span>
+                {r.source.startsWith("drf_") ? <> <Tag>from draft</Tag></> : null}
+                {r.problem ? <> <Tag status="needs-you">never matches</Tag></> : null}
+                {r.spec.active ? null : <> <Tag status="idle">inactive</Tag></>}
               </h3>
               <p>
                 {matchText(r.spec, dir.teamName, dir.agentName)} → {r.spec.outcome.reason}
@@ -323,12 +326,7 @@ export function RulesPage() {
               </p>
               {r.problem ? <p>Never matches: {r.problem}</p> : null}
               <span className="meta">
-                {r.spec.active ? null : <Tag status="idle">inactive</Tag>}
-                {r.source.startsWith("drf_") ? <Tag>from draft</Tag> : null}
-                {r.problem ? <Tag status="needs-you">never matches</Tag> : null}
-                <span>
-                  revision {r.rev} · {when(r.updatedAt)}
-                </span>
+                revision {r.rev} · {day(r.updatedAt)}
               </span>
               <div className="side">
                 <Button size="sm" aria-label={`Edit ${r.spec.title}`} onClick={() => setEditing(r)}>
