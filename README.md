@@ -86,7 +86,7 @@ Before its first claim the SDK checks that `TB_DATA_DIR` is a mounted volume; on
 1. Set the same version in `package.json` and `tealbrick.manifest.json`.
 2. Tag `v<semver>` (for example `v0.2.11`) on a green pipeline and push the tag. Tags are immutable.
 3. The release Action builds and pushes the GHCR image and the kit tarball, then writes the signed release record from the manifest. `registry-sync` signs the index entry with the image digest and the manifest digest.
-4. Core deploys the newest stable version when the owner installs or updates the app. Core main (portal-core#1, E3) switches to the new version only after a health check and rolls back when it fails; the live Core does not have this yet (it goes live with RS-3, per the portal-core README).
+4. Core deploys the newest stable version when the owner installs or updates the app. Core (E3, live since RS-3) switches to the new version only after a health check and rolls back when it fails, restoring the pre-update data snapshot; the gate is "not worse than before" (C219). The full effect needs the app to run SDK 0.1.25, which holds for the dev channel builds today and for stable after their promotion.
 
 Check `publisher` and `source.repo` in the manifest. The repository name must match the image name in `tealbrick-ci.json` (`opt2-tealbrick-rules`).
 ## Dependency pins and caching
