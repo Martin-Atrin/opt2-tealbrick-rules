@@ -1,117 +1,102 @@
-# opt2-tealbrick-rules
+# Rules & Approvals (Tealbrick mini app)
 
-Teal Brick opt2: **Rules & Approvals** (product id `rules`), the per-workspace policy: it gates other apps' calls with allow, deny or hold, always with a recorded reason.
+Rules & Approvals (product id `rules`): the per-workspace policy. It gates other apps' calls with allow, refuse or hold, always with a recorded reason. English rule requests are drafted by the owner's own agent and approved by the owner; Rules never calls a model. Built on the Miniapp SDK.
 
-**Status: opt2 build (clean-room v2 of Teal Brick), work in progress.** This repository is part of the opt2 build and lives under `Martin-Atrin` during the build; it moves to the Teal Brick organisation as one clean commit when opt2 is released. It is not the current production system.
+**Status:** 0.2.11. Visibility: public, Apache-2.0. Published as the GHCR image `ghcr.io/tealbrick/opt2-tealbrick-rules`. The manifest declares `requires.bridge: 0.1.17` (needed to carry the hold verdict).
 
-Owner lane: Lead · Rules.
+- Repository: `Tealbrick/opt2-tealbrick-rules` (GitHub organisation `Tealbrick`)
+- Licence: Apache-2.0 for the app code (`LICENSE`, `NOTICE`); upstream licences are in `THIRD_PARTY_NOTICES.md`. The Tealbrick brand mark and app art are Tealbrick artwork and are not covered by the Apache-2.0 licence.
 
 ## No secrets policy
 
-This repository is public. It must never contain secrets or personal data:
+This repository is public. It must never contain secrets or personal data, and neither may its issues or pull requests:
 
 - No API keys, tokens, passwords, private keys, deployment secrets, `.env` files or connection strings. Use `.env.example` with placeholder values only.
 - Runtime secrets live in the deployment platform (Railway variables) and are copied between services without printing them.
 - No personal names, private agent configurations or customer data.
-- Every push runs a secret scan (Woodpecker `secret-scan` step, gitleaks). GitHub secret scanning with push protection is enabled. Optional local guard: `pre-commit install`.
+- Every push runs a secret scan (gitleaks, the `secret-scan` step in `.woodpecker/ci.yaml`). GitHub secret scanning with push protection is enabled. Optional local guard: `pre-commit install`.
 - If a secret is committed anyway: rotate it first, then remove it from history.
 
 ## App
 
-A Teal Brick opt2 miniapp (product id `rules`), built on `@opt2-tealbrick/miniapp-sdk`.
-
-`tealbrick.manifest.json` is the only description of the app. The SDK derives the routes, input and output
-validation, OpenAPI, receipts, holds, idempotency, scopes, backups and status from it. You write handlers by
-operation id (`src/app.ts`) and plain migrations (`migrations/`).
+`tealbrick.manifest.json` is the only description of the app. The SDK derives the routes, input and output validation, OpenAPI, receipts, holds, idempotency, scopes, backups and status from it. You write handlers by operation id (`src/app.ts`) and plain migrations (`migrations/`). The app has no keys. The only app-specific environment variable is the test-only `TB_RULES_CATALOG_OFF`.
 
 ## What Rules does
 
-- **Gate (`rules_gate`, before hook, every product):** the first active rule that matches the call decides (lower
-  priority first): allow, refuse or hold, always with the rule's reason. No matching rule = allow (C84). Answers from
-  local cached tables only (no app call, no model call), with an own budget of 250 ms (hook limit 1 s); any error or
-  overrun refuses (fail closed). Outward, destructive and money calls, and every call a rule decided, are recorded as
-  decision traces keyed by the bridge `callId` (join with the target app's receipts).
-- **Hold (spec 0.1.13):** a hold rule answers `{allow: false, hold: {family: "policy", reason}}`; the bridge carries
-  the verdict in the call proof and the TARGET app holds the call in its own holds table (`heldBy` = `rules/rules_gate`).
-  The owner decides there; the retry of the same input runs once; a refusal on the retry still wins. If the hook-answer
-  validator ever refused a policy hold, Rules would refuse instead (fail closed).
-- **Bridge version (C104):** holds need a bridge that carries the hold verdict (`hv`, bridge 0.1.17 per C104; the
-  manifest declares `requires.bridge` from manifest 0.1.10 / spec 0.1.15 on). On an older bridge a hold is treated as
-  a deny: the hold answer also carries `reason`, so the old bridge refuses the call with "Needs owner review: <reason>"
-  (fail closed); nothing runs without the owner.
-- **Context (`rules_context`):** `rules.narrowing` v1 `{v, ruleId, reason, memoryTags {anyOf, noneOf}}` (Knowledge
-  reads it), `rules.matched`, `rules.onBehalfOf`.
-- **After (`rules_filter`, reads):** redacts result objects whose `tags[]` fail the narrowing.
-- **On behalf of:** the bridge copies the runner's claim into `tb.onBehalfOf` (unverified). Rules resolves it to Fleet
-  teams; a claim can only make a decision stricter, never wider (C82).
-- **Fleet read model (C81 G2):** Fleet `directory_get` (`sinceRevision`) through the companion grant, never inside a
-  hook: at start and every 60 s with an app-initiated call (C85), on agent-list changes, and from owner pages when
-  older than 60 s. Fail safe (A2A-9): a refusal (no grant, not found, unlicensed, any 4xx) clears the copy at once;
-  a transient failure (5xx, timeout) keeps it only while the last successful read is ≤ 10 min old. No Fleet = no teams.
-- **Badge:** pending English drafts count toward the app's `pendingHolds` (TBD badge, C86).
-- **App catalog (0.2.7, writer strict L24):** at start and every 6 h (every minute after a failure) Rules reads the
-  SIGNED release index Core reads (Platform `registry` release; JWS verified with the pinned release key =
-  platform `registry/keys.json`; each manifest checked against `manifestDigest` and `validateManifest`). Every writer
-  (owner rule create/update, dry-run candidate, `rule_draft_submit`, draft apply) refuses a rule that can never match:
-  an unknown app, an operation a named app does not declare (an MCP tool name such as `tools_call` gets "did you mean
-  `tools`"), an owner-only (person) op, or an effect the named op never has (dynamic ops excepted: the bridge sends the
-  resolved effect). Without any catalog yet, a rule that names apps is refused with `catalog_unavailable` (503).
-  Stored rules and drafts are never deleted: the Rules page flags them "never matches", and such a draft cannot be
-  applied (`draft_never_matches`, 409). The gate never reads the catalog. Unit tests set `TB_RULES_CATALOG_OFF=1`.
-- **English rules (C84):** the owner's own agent translates and calls `rule_draft_submit` (a draft only); the owner
-  approves it on the Drafts page. Rules never calls a model.
+Rules declares hooks on all products. **If Rules is down, every agent call in the workspace is refused (`hook_failed`), reads included.** A hook leaves the gate only by explicit owner action, never by a transient state.
+
+Rule shape: `title`, `active`, `priority` 0 to 1000 (lower first), `match` {agents, modes, products, operations, effects, `onBehalfOf` {teams, ids, kinds}}, `outcome` {decision allow, deny or hold; reason up to 280 characters}, optional `narrowing.memoryTags {anyOf, noneOf}`. The first matching active rule decides. No match means allow. An empty `anyOf` from an owner is refused.
+
+- **Gate (`rules_gate`, before hook, every product):** the first active rule that matches the call decides (lower priority first): allow, refuse or hold, always with the rule's reason. It answers from local cached tables only (no app call, no model call, no network), with its own budget of 250 ms (hook limit 1 s); any error or overrun refuses (fail closed). Outward, destructive and money calls, and every call a rule decided, are recorded as decision traces keyed by the bridge `callId` (join with the target app's receipts). Traces hold ids, product, operation, effect, decision, reason, rule reference and `onBehalfOf`, never call inputs or outputs; they are pruned to 30 days and 100,000 rows.
+- **Hold:** a hold rule answers `{allow: false, hold: {family: "policy", reason}}`; the bridge carries the verdict in the call proof and the TARGET app holds the call in its own holds table (`heldBy` = `rules/rules_gate`). The owner decides there; the retry of the same input runs once; a refusal on the retry still wins. If the hook-answer validator ever refused a policy hold, Rules would refuse instead (fail closed).
+- **Bridge version:** holds need a bridge that carries the hold verdict (bridge 0.1.17 or later; the manifest declares `requires.bridge`). On an older bridge a hold is treated as a deny: the hold answer also carries `reason`, so the old bridge refuses the call with "Needs owner review: <reason>" (fail closed); nothing runs without the owner.
+- **Context (`rules_context`):** `rules.narrowing` v1 `{v, ruleId, reason, memoryTags {anyOf, noneOf}}` (Knowledge reads it), `rules.matched`, `rules.onBehalfOf`.
+- **After (`rules_filter`, reads only, 2000 ms):** redacts result objects whose `tags[]` fail the narrowing.
+- **On behalf of:** the bridge copies the runner's claim into `tb.onBehalfOf` (unverified). Rules resolves it to Fleet teams; a claim can only make a decision stricter, never wider.
+- **Fleet read model:** Fleet `directory_get` (`sinceRevision`) through the companion grant, never inside a hook: at start and every 60 s with an app-initiated call, on agent-list changes, and from owner pages when older than 60 s. Fail safe: a refusal (no grant, not found, unlicensed, any 4xx) clears the copy at once; a transient failure (5xx, timeout) keeps it only while the last successful read is 10 minutes old or less. No Fleet = no teams.
+- **Badge:** pending English drafts count toward the app's `pendingHolds` (TBD badge).
+- **App catalog (since 0.2.7, writers strict):** at start and every 6 h (every minute after a failure) Rules reads the SIGNED release index that Core reads (platform `registry` release; JWS verified with the pinned release key, which is a copy of the platform `registry/keys.json`, so a release-key rotation needs a new Rules release; each manifest is checked against `manifestDigest` and `validateManifest`). Every writer (owner rule create/update, dry-run candidate, `rule_draft_submit`, draft apply) refuses a rule that can never match: an unknown app, an operation a named app does not declare (an MCP tool name such as `tools_call` gets "did you mean `tools`"), an owner-only (person) operation, or an effect the named operation never has (dynamic operations excepted: the bridge sends the resolved effect). Without any catalog yet, a rule that names apps is refused with `catalog_unavailable` (503). Stored rules and drafts are never deleted: the Rules page flags them "never matches", and such a draft cannot be applied (`draft_never_matches`, 409). The gate never reads the catalog. Unit tests set `TB_RULES_CATALOG_OFF=1`. The catalog is the only outbound call of the app (15 s timeout, 4 MB cap; outbound HTTPS to github.com).
+- **English rules:** the owner's own agent translates and calls `rule_draft_submit` (a draft only); the owner approves it on the Drafts page. Rules never calls a model.
+
+## Language
+
+New code is TypeScript (Node 24+). Swift only where the macOS app requires it.
 
 ## Layout
 
 | Path | Content |
 |---|---|
-| `tealbrick.manifest.json` | the only description: ops (person: rules, drafts, decisions, preview, teams; agent: `rules_explain`, `rule_draft_submit`), hooks, Fleet companion |
+| `tealbrick.manifest.json` | the only description: ops (person: rules, drafts, decisions, preview, Fleet status; agent: `rules_explain`, `rule_draft_submit`), hooks, Fleet companion |
 | `src/engine.ts` | pure rule engine: match, first match, narrow-only claims, narrowing merge, redaction pointers |
 | `src/hooks.ts` | the three hook handlers (fail closed) |
 | `src/store.ts` | tables: rules + revisions, drafts, decision traces, Fleet copy (cached for the gate) |
 | `src/fleet.ts` | Fleet read model sync |
+| `src/catalog.ts` | the signed app catalog (release index) used by the writers |
 | `src/app.ts` | `defineApp`: one typed handler per operation, hooks, events, `onStart` |
 | `src/ui/` | owner UI in `<AppShell>`: Rules (editor + dry run), Drafts, Decisions, Teams, Holds, Agents |
-| `migrations/0001_init.sql` | baseline; forward-only, never edit a released file |
+| `migrations/` | 2 forward-only migrations (`0001_init.sql` baseline, `0002_catalog.sql`). Never edit a released file. |
 | `skills/use-rules/SKILL.md` | the agent skill: refusals, explain, drafting rules from English |
 | `scripts/build-ui.ts` | UI build without a bundler (tsc output + vendored modules + import map) |
 | `gen/` (not committed) | `tb-gen` output; `node --run kit` generates the kit and compiles it to `dist/kit` (`#kit` import) |
 | `Dockerfile` | the one opt2 app Dockerfile pattern |
-| `.woodpecker/ci.yaml` | the opt2 CI template, byte-identical copy (do not edit) |
+| `.woodpecker/ci.yaml`, `.github/workflows/opt2-release.yml` | the opt2 CI template ci-v9.9, generated from `Tealbrick/opt2-tealbrick-platform`; do not edit |
 | `tealbrick-ci.json` | CI settings: kind `miniapp`, one image |
+| `conformance.start.ts` | boots the app for `tb-conformance` |
+| `test/` | engine, hook, catalog and app checks, UI checks |
 
 ## Develop
 
 ```sh
-pnpm install          # commit pnpm-lock.yaml: CI installs with --frozen-lockfile
+corepack enable && pnpm install --frozen-lockfile --ignore-scripts   # commit pnpm-lock.yaml: CI installs with --frozen-lockfile
 # typecheck, test, conformance, build and start first run `tb-gen kit` (op ids + I/O types from the manifest)
 pnpm typecheck && pnpm lint && pnpm test
-pnpm build            # server to dist/, UI to dist/ui
-pnpm conformance      # SDK conformance suite against this app
-TB_STANDALONE=1 TB_DATA_DIR=.data pnpm start   # app-alone mode: person UI only, no agent calls
+pnpm build            # kit, server to dist/, UI to dist/ui
+pnpm conformance      # SDK conformance suite against this app (not release evidence; QA is)
+TB_STANDALONE=1 TB_DATA_DIR=.data pnpm start   # app-alone mode: person UI only, no agent calls (operations answer 503 no_bridge)
 ```
 
 ## Environment
 
-The SDK reads only `TB_*` variables (SDK-API §13). The deploy recipe sets them: `TB_INSTANCE_ID`,
-`TB_ENROL_CODE`, `TB_BRIDGE_URL`, `TB_PORTAL_KEYS`, `TB_KEK`, `TB_DATA_DIR` (the `data` volume mount, `/data`)
-and `TB_BACKUP_DIR` (`/data/backup`: one volume per service). Optional: `TB_LOG_LEVEL`, `TB_RESTORE_FROM`,
-`TB_STANDALONE`. The listen port is the manifest `runtime.port`.
+The SDK reads only `TB_*` variables (SDK API section 13). The Dockerfile defaults `TB_DATA_DIR=/data` (the `data` volume mount) and `TB_BACKUP_DIR=/data/backup` (one volume per service). The deploy recipe sets the rest: `TB_INSTANCE_ID`, `TB_ENROL_CODE`, `TB_BRIDGE_URL`, `TB_PORTAL_KEYS`, `TB_KEK`. Optional: `TB_LOG_LEVEL`, `TB_RESTORE_FROM`, `TB_STANDALONE`. The listen port is the manifest `runtime.port`.
 
-Before its first claim the SDK checks that `TB_DATA_DIR` is a mounted volume (SDK 0.1.12); on a container's own
-disk it waits and does not use the enrolment code. Tests and CI that run `startApp` or `tb-exec` in bridge mode on
-Linux set `TB_DATA_EPHEMERAL=1` in that test or CI step (the conformance suite sets it itself; this repo's unit tests
-run app-alone and need none). Never set it in a deploy recipe.
+Before its first claim the SDK checks that `TB_DATA_DIR` is a mounted volume; on a container's own disk it waits and does not use the enrolment code. Tests and CI that run `startApp` or `tb-exec` in bridge mode on Linux set `TB_DATA_EPHEMERAL=1` in that test or CI step (the conformance suite sets it itself; this repository's unit tests run app-alone and need none). Never set it in a deploy recipe.
 
 ## Release
 
 1. Set the same version in `package.json` and `tealbrick.manifest.json`.
-2. Tag `v<semver>` (for example `v0.1.0`) and push the tag.
-3. CI builds and publishes the image, then writes the signed release record from the manifest.
+2. Tag `v<semver>` (for example `v0.2.11`) on a green pipeline and push the tag. Tags are immutable.
+3. The release Action builds and pushes the GHCR image and the kit tarball, then writes the signed release record from the manifest. `registry-sync` signs the index entry with the image digest and the manifest digest.
+4. Core deploys the newest stable version when the owner installs or updates the app. An update that fails keeps the previous version serving.
 
-Before the first push, check `publisher` and `source.repo` in the manifest. The repository name must match the
-image name in `tealbrick-ci.json` (`opt2-tealbrick-rules`).
-
+Check `publisher` and `source.repo` in the manifest. The repository name must match the image name in `tealbrick-ci.json` (`opt2-tealbrick-rules`).
 ## Dependency pins and caching
-- `pnpm-lock.yaml` carries the sha512 integrity of every GitHub-release tarball (CI rule ci-v8). After changing an `@opt2-tealbrick/*` dependency run `pnpm install`, then `node <opt2-tealbrick-platform>/ci/tb-ci.ts pin-tarballs .`, then `pnpm install --frozen-lockfile`, and commit the lockfile. Image builds run `pnpm install --frozen-lockfile --ignore-scripts`.
-- `pnpm build` writes the UI to `dist/ui/index.html` + `dist/ui/assets-<content hash>/`; the SDK serves index.html `no-cache` and the hashed directory immutable, so a deploy is visible at once (C61).
+
+- `@opt2-tealbrick/*` dependencies are pinned as tarball URLs on the dist host (`Tealbrick/opt2-tealbrick-dist` releases). `pnpm-lock.yaml` carries the sha512 integrity of every such tarball. After changing one, run `pnpm install`, then `node <opt2-tealbrick-platform>/ci/tb-ci.ts pin-tarballs .`, then `pnpm install --frozen-lockfile`, and commit the lockfile. Image builds run `pnpm install --frozen-lockfile --ignore-scripts`.
+- `pnpm build` writes the UI to `dist/ui/index.html` + `dist/ui/assets-<content hash>/`; the SDK serves `index.html` as `no-cache` and the hashed directory as immutable, so a deploy is visible at once.
+
+## Documentation
+
+- [`ARCHITECTURE.md`](ARCHITECTURE.md): design of this app (operations, scopes, data, background work).
+- [`CONTRIBUTING.md`](CONTRIBUTING.md): how to change it.
+- Runtime contract: `docs/SDK-API.md` in `Tealbrick/opt2-tealbrick-specs`. UI kit: `Tealbrick/opt2-tealbrick-packages`.
+- System documentation (overview, environments, runbooks) lives in the private repo Tealbrick/opt2-tealbrick-docs.
