@@ -1,6 +1,6 @@
 {
   "name": "opt2-tealbrick-rules",
-  "version": "0.2.11",
+  "version": "0.2.12-dev.1",
   "private": true,
   "description": "Rules and Approvals: a Teal Brick opt2 miniapp.",
   "license": "Apache-2.0",
@@ -24,7 +24,7 @@
   },
   "dependencies": {
     "@opt2-tealbrick/manifest": "https://github.com/Tealbrick/opt2-tealbrick-dist/releases/download/opt2-tealbrick-sdk-manifest-v0.1.18/opt2-tealbrick-manifest-0.1.18.tgz",
-    "@opt2-tealbrick/miniapp-sdk": "https://github.com/Tealbrick/opt2-tealbrick-dist/releases/download/opt2-tealbrick-sdk-miniapp-sdk-v0.1.22/opt2-tealbrick-miniapp-sdk-0.1.22.tgz"
+    "@opt2-tealbrick/miniapp-sdk": "https://github.com/Tealbrick/opt2-tealbrick-dist/releases/download/opt2-tealbrick-sdk-miniapp-sdk-v0.1.25/opt2-tealbrick-miniapp-sdk-0.1.25.tgz"
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.15",
