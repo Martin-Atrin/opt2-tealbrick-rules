@@ -10,7 +10,7 @@ import type { Db } from "@opt2-tealbrick/miniapp-sdk";
 import type { RuleSpec } from "./engine.ts";
 
 /** The signed release index Core reads (Platform `registry` release). */
-export const RELEASE_INDEX_URL = "https://github.com/Martin-Atrin/opt2-tealbrick-platform/releases/download/registry/index.json";
+export const RELEASE_INDEX_URL = "https://github.com/Tealbrick/opt2-tealbrick-platform/releases/download/registry/index.json";
 /** Pinned release key = opt2-tealbrick-platform `registry/keys.json` (public value; the key Core pins as RELEASE_INDEX_PUBLIC_JWKS). */
 export const RELEASE_KEYS = { keys: [{ kty: "OKP" as const, crv: "Ed25519" as const, x: "H7nxFrNugQLVOqEXVIB4aOg83Jn19UCosd27fqnoPPI" }] };
 /** Full refresh interval; a failed read retries after CATALOG_RETRY_MS. */
