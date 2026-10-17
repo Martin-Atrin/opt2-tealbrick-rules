@@ -22,10 +22,12 @@ Rules never calls a model. When the owner asks you to set a rule in plain Englis
 
 A structured rule has:
 - `title`, `priority` (0..1000, lower runs first; the first matching rule decides), `active`.
-- `match` (all named criteria must match; an empty list means any): `agents` (caller ids), `modes` (`free`, `bound`), `products`, `operations` (needs `products`; the app's MANIFEST operation ids, never MCP tool names: Connect's `connect__tools_call` / `tools_search` tools are operation `tools`; a rule naming an operation the app does not declare is refused because it would never match), `effects` (`read`, `write`, `outward`, `destructive`, `money`), `onBehalfOf` (`teams` = Fleet team ids, `ids` = person ids or handles such as `slack:U123`, `kinds`).
+- `match` (all named criteria must match; an empty list means any): `agents` (caller ids), `modes` (`free`, `bound`), `products`, `operations` (needs `products`; the app's MANIFEST operation ids, never MCP tool names: Connect's `connect__tools_call` / `tools_search` tools are operation `tools`; a rule naming an operation the app does not declare is refused because it would never match), `effects` (`read`, `write`, `outward`, `destructive`, `money`), `callerTeams` (Governance team ids the CALLING agent belongs to), `onBehalfOf` (`teams` = Governance team ids, `ids` = contact ids or handles such as `slack:U123`, `kinds`, `trust` = trust states of the claimed requester: `unreviewed`, `trusted`, `limited`, `blocked`).
 - `outcome`: `decision` (`allow`, `deny`, `hold`) and `reason` (shown to agents, max 280 characters).
 - `narrowing` (only with `allow`): `memoryTags.anyOf` (only memories with one of these tags) and `memoryTags.noneOf` (never memories with these tags).
 
 Example. "When someone from team Sales tags you, talk only about work, use only work memories, and never touch money" becomes two rules: `{match: {effects: ["money"], onBehalfOf: {teams: ["<sales team id>"]}}, outcome: {decision: "deny", reason: "Requests from Sales may not involve money"}, priority: 10}` and `{match: {onBehalfOf: {teams: ["<sales team id>"]}}, outcome: {decision: "allow", reason: "Requests from Sales see only work memories"}, narrowing: {memoryTags: {anyOf: ["work"]}}, priority: 20}`.
+
+If Rules cannot read Governance, a deny or hold rule that names teams or trust applies and an allow rule that names them does not. You can check one of your drafts with `rules__draft_status` (`draftId`); it answers only for drafts you submitted.
 
 When there is no matching rule, a call is allowed. Who asked ("on behalf of") is a claim; rules about it can only make a decision stricter, never wider.
