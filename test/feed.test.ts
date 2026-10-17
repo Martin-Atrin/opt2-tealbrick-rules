@@ -55,7 +55,7 @@ test("the first fixture maps as the contract says", () => {
     "handle:slack:U012ABCDEF",
   ]);
   assert.equal(team?.name, "Sales");
-  assert.equal(d.model.trust.get("contact:ct_anna"), "trusted");
+  assert.deepEqual(d.model.trust.get("contact:ct_anna"), { trust: "trusted", gone: false });
   assert.equal(parseFeed(FIXTURES.valid[1]).unchanged, true);
 });
 

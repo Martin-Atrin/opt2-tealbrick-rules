@@ -135,7 +135,7 @@ test("preview: dry run with an unsaved candidate and per-rule steps", async () =
 
 test("rules_explain: an agent sees only its own calls' decisions", async () => {
   const { db } = migratedDb();
-  const f = (caller: string) => ({ caller: { type: "agent", id: caller, mode: "free" }, target: { product: "connect", op: "buzz_dm", effect: "outward" }, claim: null, claimVerified: false, claimTeams: [], callerTeams: [], claimTrust: null, fleetAvailable: true });
+  const f = (caller: string) => ({ caller: { type: "agent", id: caller, mode: "free" }, target: { product: "connect", op: "buzz_dm", effect: "outward" }, claim: null, claimVerified: false, claimTeams: [], claimTeamsAny: [], callerTeams: [], callerTeamsAny: [], claimTrust: null, fleetAvailable: true });
   recordDecision(db, { callId: "cal_a", phase: "before", facts: f(AGENT_A), decision: "deny", answered: "deny", reason: "no", rule: { id: "rul_1", rev: 1, title: "t" }, durationUs: 10 });
   recordDecision(db, { callId: "cal_b", phase: "before", facts: f(AGENT_B), decision: "allow", answered: "allow", reason: "ok", rule: null, durationUs: 10 });
   const mine = await run(OP.rulesExplain)({}, opCtx(db, { type: "agent", id: AGENT_A }));
@@ -152,7 +152,8 @@ const DIRECTORY = feed({ revision: 7 });
 
 test("Fleet read model: parse, departed contacts dropped, unchanged keeps, refusal empties, transient error keeps", async () => {
   const d = parseFeed(DIRECTORY);
-  assert.deepEqual(d.model.teams[0]?.keys.sort(), [`agent:${AGENT_A}`, "contact:ct_anna", "handle:slack:U777", `handle:${NPUB}`].sort());
+  assert.equal(d.model.teams[0]?.keys.length, 9, "every member, incl. removed, departed and blocked (deny/hold rules)");
+  assert.deepEqual(d.model.teams[0]?.activeKeys.sort(), [`agent:${AGENT_A}`, "contact:ct_anna", "handle:slack:U777", `handle:${NPUB}`].sort());
   const { db } = migratedDb();
   let answer: unknown = DIRECTORY;
   let fail: string | null = null;

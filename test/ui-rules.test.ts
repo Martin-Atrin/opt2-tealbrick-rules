@@ -318,12 +318,12 @@ describe("C236 / G-3: Governance data unavailable", () => {
 describe("G-3: match fields and who proposed a draft", () => {
   it("the Drafts page says 'proposed by <app>' for an app, 'from <agent>' for an agent", async () => {
     reset();
-    const byApp = { ...draft("drf_app", "Hold sends for team X.", [null]), source: { kind: "app", product: "fleet", name: "Governance", instance: "ins_1" }, submittedBy: { type: "app", id: "ins_1", name: "Governance" } };
+    const byApp = { ...draft("drf_app", "Hold sends for team X.", [null]), source: { kind: "app", name: "Governance", instance: "ins_1" }, submittedBy: { type: "app", id: "ins_1", name: "Governance" } };
     const saved = OUTPUTS.drafts_list;
     OUTPUTS.drafts_list = { drafts: [byApp, GOOD] };
     const m = await mount(h(drafts.DraftsPage, { onChange: () => {} }));
     const [app, agent] = cards(m.host) as [Element, Element];
-    assert.match(textOf(app), /proposed by Governance/);
+    assert.match(textOf(app), /proposed by an app named Governance \(unverified\)/);
     assert.doesNotMatch(textOf(agent), /proposed by/);
     assert.match(textOf(agent), /from Front desk/);
     await m.unmount();

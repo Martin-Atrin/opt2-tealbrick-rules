@@ -13,7 +13,7 @@ import { normalizeHandle, validateAgainstSchema } from "@opt2-tealbrick/manifest
 import type { Db, Json } from "@opt2-tealbrick/miniapp-sdk";
 import feedSchema from "./contracts/fleet.directory_feed.1.schema.json" with { type: "json" };
 import type { Trust } from "./engine.ts";
-import { emptyFleet, FLEET_MAX_STALE_MS, type FleetModel, type FleetTeam, fleetState, writeFleet } from "./store.ts";
+import { emptyFleet, FLEET_MAX_STALE_MS, type FleetModel, type FleetTeam, fleetState, setFleetStale, staleMarksOf, type TrustEntry, writeFleetChunked } from "./store.ts";
 
 export const FLEET_PRODUCT = "fleet";
 export const FLEET_OP = "directory_feed";
@@ -58,9 +58,9 @@ const isObj = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 
 
 const feedInvalid = (why: string): Error => Object.assign(new Error(why.slice(0, 240)), { code: FEED_INVALID });
 
-/** Least permissive last: the stricter trust wins when two contacts share a key (never widens). */
+/** Least permissive last: the stricter trust wins whenever two values meet for one key (never widens). */
 const STRICTNESS: readonly Trust[] = ["trusted", "unreviewed", "limited", "blocked"];
-const strictest = (a: Trust, b: Trust): Trust => (STRICTNESS.indexOf(a) >= STRICTNESS.indexOf(b) ? a : b);
+export const strictest = (a: Trust, b: Trust): Trust => (STRICTNESS.indexOf(a) >= STRICTNESS.indexOf(b) ? a : b);
 
 export interface ParsedFeed {
   revision: number;
@@ -69,14 +69,16 @@ export interface ParsedFeed {
 }
 
 /**
- * The model from a `directory_feed` answer. Throws (code `feed_invalid`) unless the answer passes the vendored schema and
- * every handle is canonical. Mapping:
- * - team keys: `agent:<id>` for an agent member; `contact:<id>` and `handle:<canonical>` (every handle of the contact) for
- *   a contact member;
- * - a DEPARTED or BLOCKED contact and a REMOVED agent carry no team (never widens; matches Governance's resolve_sender); a paused agent keeps its teams;
- * - trust keys: `contact:<id>` and each `handle:<h>` of a contact; a departed contact keeps its trust unless it is
- *   `trusted` (a departed person is no longer trusted; blocked/limited/unreviewed stay so deny and hold rules still see them);
- *   when two contacts share a handle the stricter trust wins.
+ * The model from a `directory_feed` answer. Throws (code `feed_invalid`) unless the answer passes the vendored schema, every
+ * handle is canonical and no team, contact or agent id is listed twice. Mapping:
+ * - TWO key sets per team. `keys` = every member (deny and hold rules); `activeKeys` = members that count (allow rules).
+ *   A DEPARTED or BLOCKED contact and a REMOVED agent are members but do not count; so is a member the producer left out
+ *   of `contacts`/`agents`. A paused agent counts. Keys are dropped PER MEMBER: an active contact that shares a handle with
+ *   a departed one keeps the handle key.
+ *   Keys: `agent:<id>`; `contact:<id>` and `handle:<canonical>` (every handle of the contact).
+ * - trust keys: `contact:<id>`, each `handle:<h>`, `agent:<id>`. A gone (departed/removed) `trusted` entry becomes
+ *   `unreviewed`; blocked/limited/unreviewed stay. When several entries share a key the STRICTER trust wins, and the key is
+ *   "gone" only if all of them are.
  */
 export function parseFeed(out: unknown): ParsedFeed {
   if (!isObj(out)) throw feedInvalid("directory_feed answered no object");
@@ -86,36 +88,55 @@ export function parseFeed(out: unknown): ParsedFeed {
   if (out.unchanged === true) return { revision, unchanged: true, model: emptyFleet() };
 
   const contacts = out.contacts as { id: string; kind: string; status: string; trust: Trust; handles: string[] }[];
+  const agents = out.agents as { id: string; status: string; trust: Trust }[];
+  const teamsIn = out.teams as { id: string; name?: string; members: { kind: string; id: string }[] }[];
   for (const c of contacts)
     for (const h of c.handles) if (normalizeHandle(h) !== h) throw feedInvalid(`a handle is not canonical (normalizeHandle): ${h.slice(0, 40)}`);
-  const agents = out.agents as { id: string; status: string }[];
+  for (const [what, ids] of [["team", teamsIn.map((t) => t.id)], ["contact", contacts.map((c) => c.id)], ["agent", agents.map((a) => a.id)]] as const) {
+    const seen = new Set<string>();
+    for (const id of ids) {
+      if (seen.has(id)) throw feedInvalid(`${what} id listed twice: ${id.slice(0, 40)}`);
+      seen.add(id);
+    }
+  }
 
-  const trust = new Map<string, Trust>();
-  const setTrust = (key: string, t: Trust) => trust.set(key, trust.has(key) ? strictest(trust.get(key) as Trust, t) : t);
-  const contactKeys = new Map<string, string[]>();
-  const gone = new Set<string>();
+  const trust = new Map<string, TrustEntry>();
+  const put = (key: string, t: Trust, gone: boolean) => {
+    const cur = trust.get(key);
+    trust.set(key, cur ? { trust: strictest(cur.trust, t), gone: cur.gone && gone } : { trust: t, gone });
+  };
+  const contactBy = new Map<string, { keys: string[]; gone: boolean }>();
   for (const c of contacts) {
     const keys = [`contact:${c.id}`, ...c.handles.map((h) => `handle:${h}`)];
-    contactKeys.set(c.id, keys);
-    if (c.status === "departed" || c.trust === "blocked") for (const k of keys) gone.add(k);
-    if (c.status === "departed" && c.trust === "trusted") continue;
-    for (const k of keys) setTrust(k, c.trust);
+    const gone = c.status === "departed" || c.trust === "blocked";
+    contactBy.set(c.id, { keys, gone });
+    const eff: Trust = gone && c.trust === "trusted" ? "unreviewed" : c.trust;
+    for (const k of keys) put(k, eff, gone);
   }
-  for (const a of agents) if (a.status === "removed") gone.add(`agent:${a.id}`);
+  const agentGone = new Map<string, boolean>();
+  for (const a of agents) {
+    const gone = a.status === "removed";
+    agentGone.set(a.id, gone);
+    put(`agent:${a.id}`, gone && a.trust === "trusted" ? "unreviewed" : a.trust, gone);
+  }
 
   const teams: FleetTeam[] = [];
-  for (const t of out.teams as { id: string; name?: string; members: { kind: string; id: string }[] }[]) {
-    const team: FleetTeam = { id: t.id, name: t.name ?? t.id, people: 0, agents: 0, keys: [] };
+  for (const t of teamsIn) {
+    const team: FleetTeam = { id: t.id, name: t.name ?? t.id, people: 0, agents: 0, keys: [], activeKeys: [] };
     for (const m of t.members) {
       if (m.kind === "agent") {
         team.agents++;
         team.keys.push(`agent:${m.id}`);
+        if (agentGone.get(m.id) === false) team.activeKeys.push(`agent:${m.id}`);
       } else {
         team.people++;
-        team.keys.push(...(contactKeys.get(m.id) ?? [`contact:${m.id}`]));
+        const c = contactBy.get(m.id);
+        team.keys.push(...(c?.keys ?? [`contact:${m.id}`]));
+        if (c && !c.gone) team.activeKeys.push(...c.keys);
       }
     }
-    team.keys = [...new Set(team.keys.filter((k) => !gone.has(k)))];
+    team.keys = [...new Set(team.keys)];
+    team.activeKeys = [...new Set(team.activeKeys)];
     teams.push(team);
   }
   return { revision, unchanged: false, model: { teams, trust } };
@@ -123,33 +144,46 @@ export function parseFeed(out: unknown): ParsedFeed {
 
 const inflight = new WeakMap<Db, Promise<void>>();
 
-/** One sync. Never throws: errors are recorded in fleet_sync.error and the last good copy is kept (unless refused). */
+/**
+ * One sync (plus at most two more when `markFleetStale` was called while it ran: the flag the first write cleared is set
+ * again and the agent-list change is read). Never throws: errors are recorded in fleet_sync.error and the last good copy is
+ * kept (unless refused).
+ */
 export function syncFleet(db: Db, callApp: CallApp, now: () => number = Date.now): Promise<void> {
   const running = inflight.get(db);
   if (running) return running;
   const p = (async () => {
-    const st = fleetState(db);
-    try {
-      const since = st.revision != null && !st.stale && st.usable ? st.revision : null;
-      const res = await callApp(FLEET_PRODUCT, FLEET_OP, since !== null ? { sinceRevision: since } : {});
-      if (res.status !== "ok") throw Object.assign(new Error("Governance held the directory read"), { code: "held" });
-      const d = parseFeed(res.output);
-      // "unchanged" is only valid for the revision we asked about; anything else is a broken answer, not a no-op.
-      if (d.unchanged && d.revision !== since) throw feedInvalid(`unchanged answered for revision ${d.revision}, asked ${since ?? "none"}`);
-      writeFleet(db, d.unchanged ? null : d.model, { revision: d.revision, error: null }, now());
-    } catch (e) {
-      const code = isObj(e) && typeof e.code === "string" ? e.code : "error";
-      const reason = e instanceof Error ? e.message : "fleet read failed";
-      const msg = (code === FEED_INVALID ? `Governance feed refused: ${reason}` : `Governance not reachable: ${code}: ${reason}`).slice(0, 280);
-      const t = now();
-      const expired = st.syncedAt == null || t - st.syncedAt > FLEET_MAX_STALE_MS;
-      // Refusal → clear now; transient → keep the last copy for ≤ 10 min after the last successful read, then clear.
-      // The timer keeps retrying every REFRESH_MS either way.
-      writeFleet(db, isRefusal(e) || expired ? emptyFleet() : null, { revision: st.revision, error: msg }, t);
+    for (let round = 0; round < 3; round++) {
+      const marks = staleMarksOf(db);
+      await syncOnce(db, callApp, now);
+      if (staleMarksOf(db) === marks) break;
+      setFleetStale(db);
     }
   })().finally(() => inflight.delete(db));
   inflight.set(db, p);
   return p;
+}
+
+async function syncOnce(db: Db, callApp: CallApp, now: () => number): Promise<void> {
+  const st = fleetState(db);
+  try {
+    const since = st.revision != null && !st.stale && st.usable ? st.revision : null;
+    const res = await callApp(FLEET_PRODUCT, FLEET_OP, since !== null ? { sinceRevision: since } : {});
+    if (res.status !== "ok") throw Object.assign(new Error("Governance held the directory read"), { code: "held" });
+    const d = parseFeed(res.output);
+    // "unchanged" is only valid for the revision we asked about; anything else is a broken answer, not a no-op.
+    if (d.unchanged && d.revision !== since) throw feedInvalid(`unchanged answered for revision ${d.revision}, asked ${since ?? "none"}`);
+    await writeFleetChunked(db, d.unchanged ? null : d.model, { revision: d.revision, error: null }, now());
+  } catch (e) {
+    const code = isObj(e) && typeof e.code === "string" ? e.code : "error";
+    const reason = e instanceof Error ? e.message : "fleet read failed";
+    const msg = (code === FEED_INVALID ? `Governance feed refused: ${reason}` : `Governance not reachable: ${code}: ${reason}`).slice(0, 280);
+    const t = now();
+    const expired = st.syncedAt == null || t - st.syncedAt > FLEET_MAX_STALE_MS;
+    // Refusal → clear now; transient → keep the last copy for ≤ 10 min after the last successful read, then clear.
+    // The timer keeps retrying every REFRESH_MS either way.
+    await writeFleetChunked(db, isRefusal(e) || expired ? emptyFleet() : null, { revision: st.revision, error: msg }, t);
+  }
 }
 
 /** Refresh when the copy is stale or older than REFRESH_MS (person ops; bounded wait so the UI stays responsive). */

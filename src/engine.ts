@@ -10,7 +10,11 @@
 // - Fleet facts (teams of the caller or of the claimed requester, trust of the claimed requester) come from the local
 //   Fleet read model. When that copy is unavailable (never read, refused, too old) a DENY or HOLD rule that names Fleet
 //   facts APPLIES (the criterion counts as met) and an ALLOW rule that names them does NOT apply: the gap can only make
-//   a decision stricter (C230, G-3, fail closed).
+//   a decision stricter (C230, G-3, fail closed). A skipped allow rule's NARROWING still applies (merged strictly), so the call
+//   never gets a wider result than it would with the facts.
+// - Two membership sets (C236 review): deny/hold rules see EVERY member of a team, including blocked, departed and removed
+//   ones (`*Any` fields); allow rules see only the members that count (`callerTeams`, `claimTeams`).
+// - A requester the directory does not know has trust `unreviewed`.
 import { normalizeTag, normalizeHandle as sharedNormalizeHandle, tagsMatch } from "@opt2-tealbrick/manifest";
 import type { RulesSetInputRuleSpec } from "#kit";
 
@@ -48,11 +52,15 @@ export interface CallFacts {
   /** `tb.onBehalfOf` claim (bridge-copied, spec 0.1.13), or null */
   claim: Claim | null;
   claimVerified: boolean;
-  /** team ids the claim resolves to (Fleet read model plus live Fleet context facts) */
+  /** team ids the claim resolves to, ACTIVE members only (used by allow rules; Fleet read model plus live Fleet facts of a member that counts) */
   claimTeams: readonly string[];
-  /** team ids of the CALLER agent (Fleet read model) */
+  /** team ids the claim resolves to, EVERY membership incl. blocked, departed, removed (used by deny and hold rules) */
+  claimTeamsAny: readonly string[];
+  /** team ids of the CALLER agent, active membership (allow rules) */
   callerTeams: readonly string[];
-  /** trust of the claimed requester (Fleet read model, contact found by contact id or canonical handle), or null if unknown */
+  /** team ids of the CALLER agent, every membership (deny and hold rules) */
+  callerTeamsAny: readonly string[];
+  /** trust of the claimed requester (Fleet read model: contact id, canonical handle or agent id); null = no claim or facts unavailable. A requester the directory does not know is `unreviewed`. */
   claimTrust: Trust | null;
   /** false = the Fleet read model cannot be relied on (never read, refused, too old): see the header */
   fleetAvailable: boolean;
@@ -72,6 +80,8 @@ export interface Verdict {
   viaClaim: boolean;
   /** true when the decisive deny/hold rule applied only because the Fleet facts it names were unavailable */
   closedOnFleet: boolean;
+  /** first allow rule skipped for unavailable Fleet facts whose narrowing is part of `narrowing` (names the rule when no rule decided) */
+  skippedRuleId: string | null;
 }
 
 export interface Step {
@@ -97,11 +107,12 @@ export function dependsOnClaim(spec: RuleSpec): boolean {
 export const NEEDS_FLEET = "needs Fleet facts, which are unavailable (allow rules do not apply without them)";
 
 /**
- * Why `rule` does not match `facts` ("" = it matches), and whether it matches only because the Fleet facts it names are
- * unavailable (`closed`, deny and hold rules only). `useClaim = false` makes every claim criterion fail.
+ * Why `rule` does not match `facts` ("" = it matches), whether it matches only because the Fleet facts it names are
+ * unavailable (`closed`, deny and hold rules only), and whether an ALLOW rule that matches on everything else was skipped
+ * because the facts are unavailable (`skipped`; its narrowing still applies). `useClaim = false` makes every claim criterion fail.
  */
-export function judge(spec: RuleSpec, facts: CallFacts, useClaim = true): { why: string; closed: boolean } {
-  const no = (why: string) => ({ why, closed: false });
+export function judge(spec: RuleSpec, facts: CallFacts, useClaim = true): { why: string; closed: boolean; skipped: boolean } {
+  const no = (why: string) => ({ why, closed: false, skipped: false });
   if (!spec.active) return no("inactive");
   const m = spec.match;
   if (!anyOf(m.agents, facts.caller.id)) return no("caller is not listed");
@@ -111,15 +122,17 @@ export function judge(spec: RuleSpec, facts: CallFacts, useClaim = true): { why:
   if (!anyOf(m.effects, facts.target.effect)) return no("effect differs");
   const strict = spec.outcome.decision !== "allow";
   let closed = false;
+  let skipped = false;
   // A Fleet criterion: met, not met, or (copy unavailable) met for a deny/hold rule and never met for an allow rule.
   const fleet = (met: boolean, why: string): string => {
     if (facts.fleetAvailable) return met ? "" : why;
-    if (!strict) return NEEDS_FLEET;
-    closed = true;
+    if (strict) closed = true;
+    else skipped = true;
     return "";
   };
   if (m.callerTeams?.length) {
-    const why = fleet(m.callerTeams.some((t) => facts.callerTeams.includes(t)), "caller is not in the teams");
+    const have = strict ? facts.callerTeamsAny : facts.callerTeams;
+    const why = fleet(m.callerTeams.some((t) => have.includes(t)), "caller is not in the teams");
     if (why) return no(why);
   }
   if (dependsOnClaim(spec)) {
@@ -130,15 +143,17 @@ export function judge(spec: RuleSpec, facts: CallFacts, useClaim = true): { why:
     if (!anyOf(obo.kinds, c.kind)) return no("claim kind differs");
     if (obo.ids?.length && !obo.ids.includes(c.id) && !obo.ids.includes(handleOf(c.id) ?? "")) return no("claimed requester is not listed");
     if (obo.teams?.length) {
-      const why = fleet(obo.teams.some((t) => facts.claimTeams.includes(t)), "claimed requester is not in the teams");
+      const have = strict ? facts.claimTeamsAny : facts.claimTeams;
+      const why = fleet(obo.teams.some((t) => have.includes(t)), "claimed requester is not in the teams");
       if (why) return no(why);
     }
     if (obo.trust?.length) {
-      const why = fleet(facts.claimTrust !== null && obo.trust.includes(facts.claimTrust), "claimed requester's trust is not listed");
+      const why = fleet(obo.trust.includes(facts.claimTrust ?? "unreviewed"), "claimed requester's trust is not listed");
       if (why) return no(why);
     }
   }
-  return { why: "", closed };
+  if (skipped) return { why: NEEDS_FLEET, closed: false, skipped: true };
+  return { why: "", closed, skipped: false };
 }
 
 export function mismatch(spec: RuleSpec, facts: CallFacts, useClaim = true): string {
@@ -150,25 +165,44 @@ export function order(rules: readonly Rule[]): Rule[] {
   return [...rules].sort((a, b) => a.spec.priority - b.spec.priority || b.updatedAt - a.updatedAt || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
 }
 
-function firstMatch(ordered: readonly Rule[], facts: CallFacts, useClaim: boolean): { rule: Rule; closed: boolean } | null {
-  for (const r of ordered) {
-    const j = judge(r.spec, facts, useClaim);
-    if (j.why === "") return { rule: r, closed: j.closed };
-  }
-  return null;
+interface Hit {
+  rule: Rule | null;
+  closed: boolean;
+  /** merged narrowing of the allow rules skipped for unavailable Fleet facts that precede the decisive rule */
+  skippedNarrowing: Narrowing | null;
+  skippedRuleId: string | null;
 }
 
-function verdictOf(hit: { rule: Rule; closed: boolean } | null): Verdict {
-  if (!hit) return { decision: "allow", reason: NO_MATCH_REASON, rule: null, narrowing: null, viaClaim: false, closedOnFleet: false };
+function firstMatch(ordered: readonly Rule[], facts: CallFacts, useClaim: boolean): Hit {
+  let skippedNarrowing: Narrowing | null = null;
+  let skippedRuleId: string | null = null;
+  for (const r of ordered) {
+    const j = judge(r.spec, facts, useClaim);
+    if (j.skipped) {
+      const n = normNarrowing(r.spec.narrowing);
+      if (n) {
+        skippedNarrowing = mergeNarrowing(skippedNarrowing, n);
+        skippedRuleId ??= r.id;
+      }
+    }
+    if (j.why === "") return { rule: r, closed: j.closed, skippedNarrowing, skippedRuleId };
+  }
+  return { rule: null, closed: false, skippedNarrowing, skippedRuleId };
+}
+
+function verdictOf(hit: Hit): Verdict {
   const rule = hit.rule;
-  const n = rule.spec.outcome.decision === "allow" ? normNarrowing(rule.spec.narrowing) : null;
+  if (!rule) return { decision: "allow", reason: NO_MATCH_REASON, rule: null, narrowing: hit.skippedNarrowing, viaClaim: false, closedOnFleet: hit.skippedNarrowing !== null, skippedRuleId: hit.skippedRuleId };
+  const own = rule.spec.outcome.decision === "allow" ? normNarrowing(rule.spec.narrowing) : null;
+  const allow = rule.spec.outcome.decision === "allow";
   return {
     decision: rule.spec.outcome.decision,
     reason: rule.spec.outcome.reason,
     rule: { id: rule.id, rev: rule.rev, title: rule.spec.title },
-    narrowing: n,
+    narrowing: allow ? mergeNarrowing(own, hit.skippedNarrowing) : null,
     viaClaim: dependsOnClaim(rule.spec),
-    closedOnFleet: hit.closed,
+    closedOnFleet: hit.closed || (allow && hit.skippedNarrowing !== null),
+    skippedRuleId: allow ? hit.skippedRuleId : null,
   };
 }
 
@@ -203,7 +237,7 @@ export function evaluate(ordered: readonly Rule[], facts: CallFacts): Verdict {
   const base = verdictOf(firstMatch(ordered, facts, false));
   const strict = SEVERITY[withClaim.decision] >= SEVERITY[base.decision] ? withClaim : base;
   if (strict.decision !== "allow") return strict;
-  return { ...strict, narrowing: mergeNarrowing(withClaim.narrowing, base.narrowing) };
+  return { ...strict, narrowing: mergeNarrowing(withClaim.narrowing, base.narrowing), skippedRuleId: withClaim.skippedRuleId ?? base.skippedRuleId, closedOnFleet: withClaim.closedOnFleet || base.closedOnFleet };
 }
 
 /** Per-rule explanation for the dry run. */
@@ -216,7 +250,7 @@ export function explain(ordered: readonly Rule[], facts: CallFacts): Step[] {
 
 /** True when Rules must record this call's decision: a default-gated effect, or a rule decided it. */
 export function recorded(facts: CallFacts, v: Verdict): boolean {
-  return GATED_EFFECTS.has(facts.target.effect) || v.rule !== null;
+  return GATED_EFFECTS.has(facts.target.effect) || v.rule !== null || v.closedOnFleet;
 }
 
 /** Tags pass the narrowing: THE G5 comparison, the manifest package's `tagsMatch` (Knowledge uses the same function, L1). */
@@ -286,4 +320,27 @@ export function specProblem(spec: RuleSpec): string {
   const m = spec.match;
   if (m.operations?.length && !m.products?.length) return "operations need products (an operation id is unique only within one app)";
   return "";
+}
+
+/**
+ * The strictest narrowing that could apply to a call: every active allow rule that has a narrowing and matches on the
+ * criteria that need no Fleet fact (caller, mode, product, operation, effect, and for claim rules: a claim of a listed kind and id), merged. Used when the verdict pinned by the
+ * before phase is missing (fail closed). `null` = no allow rule could narrow it.
+ */
+export function strictestNarrowing(ordered: readonly Rule[], facts: CallFacts): Narrowing | null {
+  let n: Narrowing | null = null;
+  for (const r of ordered) {
+    const sp = r.spec;
+    if (!sp.active || sp.outcome.decision !== "allow") continue;
+    const m = sp.match;
+    if (!anyOf(m.agents, facts.caller.id) || !anyOf(m.modes, facts.caller.mode) || !anyOf(m.products, facts.target.product) || !anyOf(m.operations, facts.target.op) || !anyOf(m.effects, facts.target.effect)) continue;
+    if (dependsOnClaim(sp)) {
+      // a claim-dependent rule can apply only with a claim of a listed kind and id; teams and trust are Fleet facts (could apply)
+      const c = facts.claim;
+      const o = m.onBehalfOf as NonNullable<typeof m.onBehalfOf>;
+      if (!c || !anyOf(o.kinds, c.kind) || (o.ids?.length && !o.ids.includes(c.id) && !o.ids.includes(handleOf(c.id) ?? ""))) continue;
+    }
+    n = mergeNarrowing(n, normNarrowing(sp.narrowing));
+  }
+  return n;
 }

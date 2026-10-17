@@ -19,6 +19,9 @@ import { AGENT_A, AGENT_B, feed, hookCtx, hookReq, migratedDb, OWNER, opCtx, spe
 type Run = (input: unknown, ctx: OpContext) => Promise<any>;
 const run = (id: keyof typeof handlers) => (handlers[id] as unknown as { run: Run }).run;
 const sha256 = (s: string) => createHash("sha256").update(s).digest("hex");
+/** Exact outcome of an evaluation: decision, deciding rule and narrowing (an absence test pins all three). */
+const out = (v: ReturnType<typeof evaluate>) => ({ decision: v.decision, rule: v.rule?.id ?? null, narrowing: v.narrowing });
+const NOTHING = { decision: "allow", rule: null, narrowing: null } as const;
 const rule = (id: string, s: Rule["spec"]): Rule => ({ id, rev: 1, spec: s, updatedAt: 1 });
 const facts = (o: Partial<CallFacts> = {}): CallFacts => ({
   caller: { type: "agent", id: AGENT_A, mode: "free" },
@@ -30,6 +33,8 @@ const facts = (o: Partial<CallFacts> = {}): CallFacts => ({
   claimTrust: null,
   fleetAvailable: true,
   ...o,
+  claimTeamsAny: o.claimTeamsAny ?? o.claimTeams ?? [],
+  callerTeamsAny: o.callerTeamsAny ?? o.callerTeams ?? [],
 });
 
 // ── (b) match.callerTeams ─────────────────────────────────────────────────────────────────────────────────────
@@ -37,8 +42,8 @@ test("callerTeams: matches only an agent in one of the teams; no teams, other te
   const rules = order([rule("rul_a", spec({ match: { callerTeams: ["tm_x", "tm_z"] }, decision: "deny", reason: "team X may not send" }))]);
   assert.equal(evaluate(rules, facts({ callerTeams: ["tm_x"] })).rule?.id, "rul_a");
   assert.equal(evaluate(rules, facts({ callerTeams: ["tm_z", "tm_q"] })).rule?.id, "rul_a");
-  assert.equal(evaluate(rules, facts({ callerTeams: ["tm_y"] })).decision, "allow", "quiet: another team");
-  assert.equal(evaluate(rules, facts()).decision, "allow", "quiet: no team");
+  assert.deepEqual(out(evaluate(rules, facts({ callerTeams: ["tm_y"] }))), NOTHING, "quiet: another team");
+  assert.deepEqual(out(evaluate(rules, facts())), NOTHING, "quiet: no team");
   assert.deepEqual(explain(rules, facts({ callerTeams: ["tm_y"] }))[0], { ruleId: "rul_a", title: "rule", matched: false, why: "caller is not in the teams" });
 });
 
@@ -46,12 +51,17 @@ test("callerTeams: matches only an agent in one of the teams; no teams, other te
 test("onBehalfOf.trust: needs a claim whose contact has one of the listed trust states", () => {
   const rules = order([rule("rul_t", spec({ match: { onBehalfOf: { trust: ["unreviewed", "blocked"] } }, decision: "hold", reason: "unknown or blocked requester" }))]);
   const claim = { kind: "channel_sender" as const, id: "slack:U777" };
-  assert.equal(evaluate(rules, facts({ claim, claimTrust: "blocked" })).decision, "hold");
-  assert.equal(evaluate(rules, facts({ claim, claimTrust: "unreviewed" })).decision, "hold");
-  assert.equal(evaluate(rules, facts({ claim, claimTrust: "trusted" })).decision, "allow", "quiet: trusted");
-  assert.equal(evaluate(rules, facts({ claim, claimTrust: null })).decision, "allow", "quiet: a requester Governance does not know has no trust");
-  assert.equal(evaluate(rules, facts({ claimTrust: "blocked" })).decision, "allow", "quiet: no claim");
+  assert.deepEqual(out(evaluate(rules, facts({ claim, claimTrust: "blocked" }))), { decision: "hold", rule: "rul_t", narrowing: null });
+  assert.deepEqual(out(evaluate(rules, facts({ claim, claimTrust: "unreviewed" }))), { decision: "hold", rule: "rul_t", narrowing: null });
+  assert.deepEqual(out(evaluate(rules, facts({ claim, claimTrust: "trusted" }))), NOTHING, "quiet: trusted");
+  assert.deepEqual(
+    (({ decision, rule }) => ({ decision, rule: rule?.id }))(evaluate(rules, facts({ claim, claimTrust: null }))),
+    { decision: "hold", rule: "rul_t" },
+    "a requester Governance does not know is unreviewed (fail closed)",
+  );
+  assert.deepEqual(out(evaluate(rules, facts({ claimTrust: "blocked" }))), NOTHING, "quiet: no claim");
   assert.equal(explain(rules, facts({ claim, claimTrust: "trusted" }))[0]?.why, "claimed requester's trust is not listed");
+  assert.equal(explain(rules, facts({ claim, claimTrust: null }))[0]?.matched, true);
 });
 
 test("onBehalfOf.trust through an UNVERIFIED claim only narrows (C82): an allow by trust never beats a later deny", () => {
@@ -60,11 +70,11 @@ test("onBehalfOf.trust through an UNVERIFIED claim only narrows (C82): an allow 
     rule("rul_deny", spec({ priority: 2, match: { effects: ["outward"] }, decision: "deny", reason: "no sends" })),
   ]);
   const claim = { kind: "person" as const, id: "ct_anna" };
-  assert.equal(evaluate(rules, facts({ claim, claimTrust: "trusted", claimVerified: false })).decision, "deny");
-  assert.equal(evaluate(rules, facts({ claim, claimTrust: "trusted", claimVerified: true })).decision, "allow", "verified: the allow applies");
+  assert.deepEqual(out(evaluate(rules, facts({ claim, claimTrust: "trusted", claimVerified: false }))), { decision: "deny", rule: "rul_deny", narrowing: null });
+  assert.deepEqual(out(evaluate(rules, facts({ claim, claimTrust: "trusted", claimVerified: true }))), { decision: "allow", rule: "rul_allow", narrowing: null }, "verified: the allow applies");
   // a deny by trust through an unverified claim does apply (narrowing)
   const deny = order([rule("rul_b", spec({ match: { onBehalfOf: { trust: ["blocked"] } }, decision: "deny", reason: "blocked" }))]);
-  assert.equal(evaluate(deny, facts({ claim, claimTrust: "blocked", claimVerified: false })).decision, "deny");
+  assert.deepEqual(out(evaluate(deny, facts({ claim, claimTrust: "blocked", claimVerified: false }))), { decision: "deny", rule: "rul_b", narrowing: null });
 });
 
 // ── fail closed, engine level ─────────────────────────────────────────────────────────────────────────────────
@@ -74,29 +84,29 @@ test("FAIL CLOSED (engine): unavailable facts → deny/hold rules that name Flee
     for (const decision of ["deny", "hold"] as const) {
       const r = order([rule("rul_c", spec({ match: m as never, decision, reason: "closed" }))]);
       const down = evaluate(r, facts({ claim, fleetAvailable: false }));
-      assert.equal(down.decision, decision, `${JSON.stringify(m)} ${decision}: applies while unavailable`);
+      assert.deepEqual(out(down), { decision, rule: "rul_c", narrowing: null }, `${JSON.stringify(m)} ${decision}: applies while unavailable`);
       assert.equal(down.closedOnFleet, true);
       assert.equal(explain(r, facts({ claim, fleetAvailable: false }))[0]?.matched, true);
       const up = evaluate(r, facts({ claim, fleetAvailable: true }));
-      assert.equal(up.decision, "allow", `${JSON.stringify(m)} ${decision}: quiet when available and not a member`);
+      assert.deepEqual(out(up), NOTHING, `${JSON.stringify(m)} ${decision}: quiet when available and not a member`);
       assert.equal(up.closedOnFleet, false);
     }
     const allow = order([rule("rul_a", spec({ match: m as never, decision: "allow", reason: "ok" }))]);
     const down = evaluate(allow, facts({ claim, fleetAvailable: false, callerTeams: ["tm_x"], claimTeams: ["tm_x"], claimTrust: "blocked" }));
-    assert.equal(down.rule, null, `${JSON.stringify(m)}: an allow rule does not apply while unavailable, even if stale facts would match`);
+    assert.deepEqual(out(down), NOTHING, `${JSON.stringify(m)}: an allow rule does not apply while unavailable, even if stale facts would match`);
     assert.match(explain(allow, facts({ claim, fleetAvailable: false }))[0]?.why ?? "", /^needs Fleet facts, which are unavailable/);
     assert.equal(evaluate(allow, facts({ claim, fleetAvailable: true, callerTeams: ["tm_x"], claimTeams: ["tm_x"], claimTrust: "blocked" })).rule?.id, "rul_a", "quiet: available and matching → applies");
   }
   // not fleet facts: the closure never touches other criteria
   const other = order([rule("rul_o", spec({ match: { effects: ["money"], callerTeams: ["tm_x"] }, decision: "deny", reason: "x" }))]);
-  assert.equal(evaluate(other, facts({ fleetAvailable: false })).decision, "allow", "effect differs → still no match");
+  assert.deepEqual(out(evaluate(other, facts({ fleetAvailable: false }))), NOTHING, "effect differs → still no match");
   // a claim-dependent rule without a claim does not apply even when closed (it names a requester)
   const noClaim = order([rule("rul_n", spec({ match: { onBehalfOf: { teams: ["tm_x"] } }, decision: "deny", reason: "x" }))]);
-  assert.equal(evaluate(noClaim, facts({ fleetAvailable: false })).decision, "allow");
+  assert.deepEqual(out(evaluate(noClaim, facts({ fleetAvailable: false }))), NOTHING);
   // an id list is not a Fleet fact: wrong id → no match
   const ids = order([rule("rul_i", spec({ match: { onBehalfOf: { ids: ["slack:U111"], teams: ["tm_x"] } }, decision: "deny", reason: "x" }))]);
-  assert.equal(evaluate(ids, facts({ claim: { kind: "channel_sender", id: "slack:U222" }, fleetAvailable: false })).decision, "allow");
-  assert.equal(evaluate(ids, facts({ claim: { kind: "channel_sender", id: "slack:U111" }, fleetAvailable: false })).decision, "deny");
+  assert.deepEqual(out(evaluate(ids, facts({ claim: { kind: "channel_sender", id: "slack:U222" }, fleetAvailable: false }))), NOTHING);
+  assert.deepEqual(out(evaluate(ids, facts({ claim: { kind: "channel_sender", id: "slack:U111" }, fleetAvailable: false }))), { decision: "deny", rule: "rul_i", narrowing: null });
 });
 
 // ── rule spec validation ──────────────────────────────────────────────────────────────────────────────────────
@@ -223,8 +233,8 @@ test("rule_draft_submit from an APP records source {kind:'app', product, name}; 
   const agent = opCtx(db, { type: "agent", id: AGENT_A, name: "Front desk" });
   const ids: Record<string, string> = {};
   for (const [k, ctx] of [["app", app], ["unknown", unknown], ["agent", agent]] as const) ids[k] = (await run(OP.ruleDraftSubmit)({ text: k, rules: [spec({})] }, ctx)).draftId;
-  assert.deepEqual(getDraft(db, ids.app as string)?.source, { kind: "app", product: "fleet", name: "Governance", instance: "ins_01J00000000000000000000GOV" });
-  assert.deepEqual(getDraft(db, ids.unknown as string)?.source, { kind: "app", name: "Some Other App", instance: "ins_01J00000000000000000000OTH" }, "an unknown app: no invented product");
+  assert.deepEqual(getDraft(db, ids.app as string)?.source, { kind: "app", name: "Governance", instance: "ins_01J00000000000000000000GOV" }, "no product: the SDK has no Caller.product, so none is verified");
+  assert.deepEqual(getDraft(db, ids.unknown as string)?.source, { kind: "app", name: "Some Other App", instance: "ins_01J00000000000000000000OTH" }, "another app: same shape");
   assert.deepEqual(getDraft(db, ids.agent as string)?.source, { kind: "agent" });
   const listed = (await run(OP.draftsList)({}, owner)).drafts;
   assert.equal(listed.find((d: { id: string }) => d.id === ids.app).source.name, "Governance");
@@ -240,7 +250,7 @@ test("released migrations 0001 and 0002 are byte-for-byte what 0.2.12 shipped", 
     "0001_init.sql": "6386d3c572cd7a8c678a8b3d4ad18fdf228cc73a865456ab0ac236399b177a32",
     "0002_catalog.sql": "77879e04075f37575b37a285a4f4dfe7243a62756bd946c7a588846058184c79",
   });
-  assert.deepEqual(readdirSync(migrationsDir).filter((f) => f.endsWith(".sql")).sort(), ["0001_init.sql", "0002_catalog.sql", "0003_feed.sql"]);
+  assert.deepEqual(readdirSync(migrationsDir).filter((f) => f.endsWith(".sql")).sort(), ["0001_init.sql", "0002_catalog.sql", "0003_feed.sql", "0004_feed_sets.sql"]);
 });
 
 test("upgrade from a 0.2.12 database: rules, drafts and decisions stay; the old Fleet copy is cleared and unusable; old drafts get a derived source", () => {
@@ -258,6 +268,7 @@ test("upgrade from a 0.2.12 database: rules, drafts and decisions stay; the old 
   `);
   assert.equal(Number(raw.prepare("SELECT stale FROM fleet_sync").get()?.stale), 0, "0.2.12: a fresh, usable copy");
   raw.exec(readFileSync(join(migrationsDir, "0003_feed.sql"), "utf8"));
+  raw.exec(readFileSync(join(migrationsDir, "0004_feed_sets.sql"), "utf8"));
   const q = (sql: string) => raw.prepare(sql).all() as Record<string, unknown>[];
   assert.equal(q("SELECT id FROM rules")[0]?.id, "rul_old", "rules stay");
   assert.equal(q("SELECT id FROM drafts").length, 2, "drafts stay");
@@ -278,7 +289,7 @@ test("upgrade from a 0.2.12 database: rules, drafts and decisions stay; the old 
       return out;
     },
   } as never;
-  assert.deepEqual(getDraft(db, "drf_app")?.source, { kind: "app", product: "fleet", name: "Governance", instance: "ins_1" });
+  assert.deepEqual(getDraft(db, "drf_app")?.source, { kind: "app", name: "Governance", instance: "ins_1" });
   assert.deepEqual(getDraft(db, "drf_agent")?.source, { kind: "agent" });
   assert.equal(fleetFacts(db).available, false);
 });

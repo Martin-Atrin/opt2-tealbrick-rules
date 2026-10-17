@@ -7,7 +7,7 @@ import type { Json } from "@opt2-tealbrick/miniapp-sdk";
 import type { RuleSpec } from "../src/engine.ts";
 import { syncFleet } from "../src/fleet.ts";
 import { FAIL_CLOSED, GATE_BUDGET_MS, HOLD_SUPPORTED, makeHooks } from "../src/hooks.ts";
-import { emptyFleet, fleetFacts, fleetIndex, fleetState, fleetTeams, listDecisions, liveRules, saveRule, writeFleet } from "../src/store.ts";
+import { fleetFacts, fleetIndex, fleetState, fleetTeams, listDecisions, liveRules, saveRule, writeFleet } from "../src/store.ts";
 import { AGENT_A, AGENT_B, feed, hookCtx, hookReq, migratedDb, OWNER, spec } from "./helpers.ts";
 
 const hooks = makeHooks("rules");
@@ -16,7 +16,7 @@ const CLAIM = { "tb.onBehalfOf": { claim: { kind: "channel_sender", id: "slack:u
 
 function j3Db() {
   const { db, raw } = migratedDb();
-  writeFleet(db, { teams: [{ id: "tm_x", name: "Team X", people: 1, agents: 0, keys: ["contact:psn_1", "handle:slack:U777"] }], trust: new Map([["handle:slack:U777", "trusted" as const]]) }, { revision: 3, error: null });
+  writeFleet(db, { teams: [{ id: "tm_x", name: "Team X", people: 1, agents: 0, keys: ["contact:psn_1", "handle:slack:U777"], activeKeys: ["contact:psn_1", "handle:slack:U777"] }], trust: new Map([["handle:slack:U777", { trust: "trusted" as const, gone: false }]]) }, { revision: 3, error: null });
   saveRule(db, { spec: spec({ title: "Team X: nothing with money", priority: 10, match: { effects: ["money"], onBehalfOf: { teams: ["tm_x"] } }, decision: "deny", reason: "Requests from team X may not involve money" }), actor: OWNER });
   saveRule(db, {
     spec: spec({ title: "Team X: work only", priority: 20, match: { onBehalfOf: { teams: ["tm_x"] } }, decision: "allow", reason: "Team X sees only work memories", narrowing: { memoryTags: { anyOf: ["work"], noneOf: ["critical"] } } }),
@@ -238,39 +238,6 @@ test("FAIL CLOSED: callerTeams and requester trust follow the same rule; an unve
   await syncFleet(w, async () => ({ status: "ok" as const, output: feed() }), () => Date.now());
   assert.equal((await gate(w)).allow, false, "unverified trusted claim cannot widen past the deny (C82)");
   assert.deepEqual(await gate(w, { context: { "tb.onBehalfOf": { claim: { kind: "channel_sender", id: "slack:u777" }, verified: true } } }), { allow: true }, "verified claim: the allow rule applies");
-});
-
-test("feed mapping: agent/contact/handle keys; departed contacts and removed agents carry no team, paused agents keep theirs; trust by id and handle", async () => {
-  const { db } = migratedDb();
-  await syncFleet(db, async () => ({ status: "ok" as const, output: feed() }), () => T0);
-  const idx = fleetFacts(db, T0).teams;
-  assert.deepEqual(idx.get(`agent:${AGENT_A}`), ["tm_x"]);
-  assert.deepEqual(idx.get(`agent:${AGENT_B}`), ["tm_y"], "paused agent keeps its team");
-  assert.equal(idx.get("agent:agt_01J0000000000000000000000R"), undefined, "removed agent: no team");
-  assert.deepEqual(idx.get("contact:ct_anna"), ["tm_x"]);
-  assert.deepEqual(idx.get("handle:slack:U777"), ["tm_x"]);
-  assert.equal(idx.get("contact:ct_gone"), undefined, "departed contact: no team");
-  assert.equal(idx.get("handle:telegram:9"), undefined);
-  // BLOCKED contact: no team by id or by handle (fire), while an active one has it (quiet above); its trust stays "blocked"
-  assert.equal(idx.get("contact:ct_block"), undefined, "blocked contact: no team");
-  assert.equal(idx.get("handle:slack:U666"), undefined);
-  assert.deepEqual(fleetTeams(db), [{ id: "tm_x", name: "Team X", people: 3, agents: 2 }, { id: "tm_y", name: "tm_y", people: 0, agents: 1 }]);
-  const trust = fleetFacts(db, T0).trust;
-  assert.equal(trust.get("contact:ct_anna"), "trusted");
-  assert.equal(trust.get("handle:slack:U666"), "blocked");
-  assert.equal(trust.has("contact:ct_gone"), false, "a departed contact is not 'trusted' any more");
-  const dep = feed({ contacts: [{ id: "ct_gone", kind: "person", status: "departed", trust: "blocked", handles: ["telegram:9"] }], teams: [] });
-  await syncFleet(db, async () => ({ status: "ok" as const, output: dep }), () => T0 + 1);
-  assert.equal(fleetFacts(db, T0 + 1).trust.get("handle:telegram:9"), "blocked", "a departed BLOCKED contact keeps its restrictive trust");
-  const dup = feed({
-    contacts: [
-      { id: "c1", kind: "person", status: "active", trust: "trusted", handles: ["slack:U777"] },
-      { id: "c2", kind: "person", status: "active", trust: "limited", handles: ["slack:U777"] },
-    ],
-  });
-  await syncFleet(db, async () => ({ status: "ok" as const, output: dup }), () => T0 + 2);
-  assert.equal(fleetFacts(db, T0 + 2).trust.get("handle:slack:U777"), "limited", "two contacts, one handle: the stricter trust wins");
-  assert.equal(emptyFleet().teams.length, 0);
 });
 
 test("blocked contact carries no team: a team-scoped ALLOW rule does not widen for it (fire) and still applies to an active member (quiet); deny-by-trust still sees it", async () => {

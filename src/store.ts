@@ -26,7 +26,18 @@ const json = <T>(s: unknown, fallback: T): T => {
 
 // ── caches ───────────────────────────────────────────────────────────────────
 const ruleCache = new WeakMap<Db, Rule[]>();
-const fleetCache = new WeakMap<Db, { idx: Map<string, string[]>; trust: Map<string, Trust>; okAt: number | null; usable: boolean }>();
+interface FleetCacheEntry {
+  idx: Map<string, string[]>;
+  idxAny: Map<string, string[]>;
+  trust: Map<string, Trust>;
+  gone: Set<string>;
+  okAt: number | null;
+  usable: boolean;
+}
+const fleetCache = new WeakMap<Db, FleetCacheEntry>();
+/** Count of markFleetStale calls per database: a sync that sees it move while it ran reads once more (dirty flag). */
+const staleMarks = new WeakMap<Db, number>();
+export const staleMarksOf = (db: Db): number => staleMarks.get(db) ?? 0;
 /**
  * A Fleet copy older than this (no successful read since) is not used (A2A-9): the facts count as UNAVAILABLE, so deny and
  * hold rules that name Fleet facts apply and allow rules that name them do not (C230, fail closed).
@@ -147,35 +158,20 @@ export interface DraftView {
 
 export interface DraftSource {
   kind: "agent" | "app";
-  /** product id of the proposing app, when Rules knows it (the SDK names an app caller by instance id and manifest name only) */
+  /** product id of the proposing app, only when verified (never today: the SDK has no Caller.product) */
   product?: string;
   name?: string;
   instance?: string;
 }
 
 /**
- * Product id for the manifest name of a Tealbrick app, as an app caller is named by the SDK (`Caller.name` = the caller's
- * manifest `name` from the verified slice `companionCallers`, SDK 0.1.25; the product id itself is not on the context).
- * Unknown names give no product (the Drafts page shows the name).
+ * Who proposed a draft. An app caller is named by the SDK from the verified slice (`Caller.name` = the caller's manifest
+ * name, `Caller.id` = its instance id, SDK 0.1.25). The SDK gives no product id on the context, so `product` is NEVER set
+ * here: a product is recorded only when it is verified (SDK request pending). The Drafts page shows the name as unverified.
  */
-export const APP_PRODUCTS: Readonly<Record<string, string>> = {
-  Governance: "fleet",
-  "Organization Plane": "fleet",
-  "Rules & Approvals": "rules",
-  Connect: "connect",
-  Knowledge: "knowledge",
-  "Operator Inbox": "inbox",
-  "Task Board": "kanban",
-  Observer: "observer",
-  Creative: "creative",
-  "Evolving Workflows": "evolution",
-  "Live Artifacts": "live-artifacts",
-};
-
 export function sourceOf(by: { type: string; id: string; name: string }): DraftSource {
   if (by.type !== "app") return { kind: "agent" };
-  const product = APP_PRODUCTS[by.name];
-  return { kind: "app", ...(product ? { product } : {}), name: by.name.slice(0, 80), instance: by.id };
+  return { kind: "app", name: by.name.slice(0, 80), instance: by.id };
 }
 
 function draftView(r: Record<string, unknown>): DraftView {
@@ -375,14 +371,22 @@ export interface FleetTeam {
   name: string;
   people: number;
   agents: number;
-  /** member keys: agent:<id>, contact:<id>, handle:<canonical handle> */
+  /** member keys of EVERY member: agent:<id>, contact:<id>, handle:<canonical handle> (deny and hold rules) */
   keys: string[];
+  /** the keys of members that count (not blocked, departed, removed): a subset of `keys` (allow rules) */
+  activeKeys: string[];
+}
+
+export interface TrustEntry {
+  trust: Trust;
+  /** every contact or agent behind the key is blocked, departed or removed */
+  gone: boolean;
 }
 
 /** One read of the feed, mapped: teams with member keys, and the trust of each contact key (contact:<id>, handle:<h>). */
 export interface FleetModel {
   teams: FleetTeam[];
-  trust: Map<string, Trust>;
+  trust: Map<string, TrustEntry>;
 }
 
 export interface FleetSyncState {
@@ -406,8 +410,14 @@ export function fleetState(db: Db): FleetSyncState {
   };
 }
 
-export function markFleetStale(db: Db): void {
+/** Set the stale flag without counting it (a sync re-arming itself). */
+export function setFleetStale(db: Db): void {
   db.prepare("UPDATE fleet_sync SET stale = 1 WHERE id = 1").run();
+}
+
+export function markFleetStale(db: Db): void {
+  staleMarks.set(db, staleMarksOf(db) + 1);
+  setFleetStale(db);
 }
 
 /**
@@ -415,24 +425,98 @@ export function markFleetStale(db: Db): void {
  * time moves and the copy is usable. Failure: `model` = an EMPTY model clears the copy (revision forgotten, next read is a
  * full one, copy unusable), null keeps it; the last successful read time stays.
  */
-export function writeFleet(db: Db, model: FleetModel | null, state: { revision: number | null; error: string | null }, now = Date.now()): void {
-  db.transaction(() => {
-    if (model) {
-      db.exec("DELETE FROM fleet_members; DELETE FROM fleet_teams; DELETE FROM fleet_trust;");
-      const t = db.prepare("INSERT INTO fleet_teams (id, name, people, agents) VALUES (?, ?, ?, ?)");
-      const m = db.prepare("INSERT OR IGNORE INTO fleet_members (team_id, member_key) VALUES (?, ?)");
-      for (const team of model.teams) {
-        t.run(team.id, team.name, team.people, team.agents);
-        for (const k of team.keys) m.run(team.id, k);
-      }
-      const tr = db.prepare("INSERT OR REPLACE INTO fleet_trust (member_key, trust) VALUES (?, ?)");
-      for (const [k, v] of model.trust) tr.run(k, v);
+/** Rows per transaction while a big directory is written (about 10 ms each); the loop yields to the event loop between them. */
+export const FLEET_WRITE_CHUNK_ROWS = 4000;
+
+const add = (map: Map<string, string[]>, k: string, team: string) => {
+  const list = map.get(k);
+  if (list) list.push(team);
+  else map.set(k, [team]);
+};
+
+/**
+ * One sync outcome, as steps (a generator yields between transactions so a big directory never blocks the event loop for
+ * long). Step 1 clears members and trust and marks the copy unusable, the chunks insert rows (the gate's index is built
+ * from the same rows, once per sync, here), the last transaction writes teams and the sync row and swaps the in-memory
+ * index. A crash in between leaves `usable = 0`: the copy is unavailable (fail closed) and the next read is a full one.
+ */
+function* writeSteps(db: Db, model: FleetModel | null, state: { revision: number | null; error: string | null }, now: number): Generator<void, void, void> {
+  if (!model) {
+    db.transaction(() => {
+      if (state.error === null) db.prepare("UPDATE fleet_sync SET revision = ?, synced_at = ?, stale = 0, error = NULL, usable = 1 WHERE id = 1").run(state.revision, now);
+      else db.prepare("UPDATE fleet_sync SET error = ? WHERE id = 1").run(state.error);
+    });
+    // an "unchanged" answer moves the read time; a transient error changes nothing the gate uses
+    const hit = fleetCache.get(db);
+    if (state.error === null) {
+      if (hit) fleetCache.set(db, { ...hit, okAt: now, usable: true });
+      else fleetCache.delete(db);
     }
-    if (state.error === null) db.prepare("UPDATE fleet_sync SET revision = ?, synced_at = ?, stale = 0, error = NULL, usable = 1 WHERE id = 1").run(state.revision, now);
-    else if (model) db.prepare("UPDATE fleet_sync SET revision = NULL, stale = 1, error = ?, usable = 0 WHERE id = 1").run(state.error);
-    else db.prepare("UPDATE fleet_sync SET error = ? WHERE id = 1").run(state.error);
+    return;
+  }
+  db.transaction(() => {
+    db.exec("DELETE FROM fleet_members; DELETE FROM fleet_trust;");
+    db.prepare("UPDATE fleet_sync SET usable = 0, stale = 1 WHERE id = 1").run();
   });
-  fleetCache.delete(db);
+  const idx = new Map<string, string[]>();
+  const idxAny = new Map<string, string[]>();
+  const trust = new Map<string, Trust>();
+  const gone = new Set<string>();
+  const m = db.prepare("INSERT OR IGNORE INTO fleet_members (team_id, member_key, active) VALUES (?, ?, ?)");
+  const tr = db.prepare("INSERT OR REPLACE INTO fleet_trust (member_key, trust, gone) VALUES (?, ?, ?)");
+  let batch: (() => void)[] = [];
+  function* flush(force: boolean): Generator<void, void, void> {
+    if (batch.length === 0 || (!force && batch.length < FLEET_WRITE_CHUNK_ROWS)) return;
+    const rows = batch;
+    batch = [];
+    db.transaction(() => {
+      for (const run of rows) run();
+    });
+    yield;
+  }
+  for (const team of model.teams) {
+    const active = new Set(team.activeKeys);
+    for (const k of team.keys) {
+      const on = active.has(k);
+      add(idxAny, k, team.id);
+      if (on) add(idx, k, team.id);
+      batch.push(() => m.run(team.id, k, on ? 1 : 0));
+      yield* flush(false);
+    }
+  }
+  for (const [k, v] of model.trust) {
+    trust.set(k, v.trust);
+    if (v.gone) gone.add(k);
+    batch.push(() => tr.run(k, v.trust, v.gone ? 1 : 0));
+    yield* flush(false);
+  }
+  yield* flush(true);
+  db.transaction(() => {
+    db.exec("DELETE FROM fleet_teams;");
+    const t = db.prepare("INSERT INTO fleet_teams (id, name, people, agents) VALUES (?, ?, ?, ?)");
+    for (const team of model.teams) t.run(team.id, team.name, team.people, team.agents);
+    if (state.error === null) db.prepare("UPDATE fleet_sync SET revision = ?, synced_at = ?, stale = 0, error = NULL, usable = 1 WHERE id = 1").run(state.revision, now);
+    else db.prepare("UPDATE fleet_sync SET revision = NULL, stale = 1, error = ?, usable = 0 WHERE id = 1").run(state.error);
+  });
+  const usable = state.error === null;
+  fleetCache.set(db, { idx, idxAny, trust, gone, okAt: usable ? now : fleetState(db).syncedAt, usable });
+}
+
+/** Synchronous write (one go): small models, errors, tests. */
+export function writeFleet(db: Db, model: FleetModel | null, state: { revision: number | null; error: string | null }, now = Date.now()): void {
+  for (const g = writeSteps(db, model, state, now); !g.next().done; );
+}
+
+/** The write the sync uses: the same steps, yielding to the event loop between transactions. */
+export async function writeFleetChunked(
+  db: Db,
+  model: FleetModel | null,
+  state: { revision: number | null; error: string | null },
+  now = Date.now(),
+  pause: () => Promise<void> = () => new Promise((r) => setImmediate(r)),
+): Promise<void> {
+  const g = writeSteps(db, model, state, now);
+  for (let r = g.next(); !r.done; r = g.next()) await pause();
 }
 
 export const emptyFleet = (): FleetModel => ({ teams: [], trust: new Map() });
@@ -447,43 +531,52 @@ export function fleetTeams(db: Db): { id: string; name: string; people: number; 
 export interface FleetFacts {
   /** false = never read, refused, or no successful read within FLEET_MAX_STALE_MS: the maps below are empty */
   available: boolean;
-  /** member key → team ids */
+  /** member key → team ids, members that COUNT only (allow rules) */
   teams: Map<string, string[]>;
-  /** contact key (`contact:<id>`, `handle:<h>`) → trust */
+  /** member key → team ids, EVERY membership incl. blocked, departed, removed (deny and hold rules) */
+  teamsAny: Map<string, string[]>;
+  /** contact/agent key (`contact:<id>`, `handle:<h>`, `agent:<id>`) → trust; a key that is missing is `unreviewed` */
   trust: Map<string, Trust>;
+  /** keys whose every contact/agent is blocked, departed or removed */
+  gone: Set<string>;
 }
 
+const NONE = (): FleetFacts => ({ available: false, teams: new Map(), teamsAny: new Map(), trust: new Map(), gone: new Set() });
+
 /**
- * The Fleet facts the gate may use; cached until the next sync. `available` is false (and the maps empty) unless a read
- * succeeded within FLEET_MAX_STALE_MS and no refusal cleared the copy, so a copy that can no longer be confirmed never
- * decides, whatever stopped the refresh. The engine then treats deny/hold rules that name Fleet facts as applying.
+ * The Fleet facts the gate may use; cached until the next sync (built at write time). `available` is false (and the maps
+ * empty) unless a read succeeded within FLEET_MAX_STALE_MS and no refusal cleared the copy, so a copy that can no longer be
+ * confirmed never decides, whatever stopped the refresh. The engine then treats deny/hold rules that name Fleet facts as
+ * applying and skips allow rules that name them.
  */
 export function fleetFacts(db: Db, now = Date.now()): FleetFacts {
   let hit = fleetCache.get(db);
   if (!hit) {
     const st = fleetState(db);
-    const { idx, trust } = loadFleet(db);
-    hit = { idx, trust, okAt: st.syncedAt, usable: st.usable };
+    hit = { ...loadFleet(db), okAt: st.syncedAt, usable: st.usable };
     fleetCache.set(db, hit);
   }
   const available = hit.usable && hit.okAt != null && now - hit.okAt <= FLEET_MAX_STALE_MS;
-  return available ? { available, teams: hit.idx, trust: hit.trust } : { available: false, teams: new Map(), trust: new Map() };
+  return available ? { available, teams: hit.idx, teamsAny: hit.idxAny, trust: hit.trust, gone: hit.gone } : NONE();
 }
 
-/** member key → team ids (empty while unavailable). */
+/** member key → team ids of members that count (empty while unavailable). */
 export function fleetIndex(db: Db, now = Date.now()): Map<string, string[]> {
   return fleetFacts(db, now).teams;
 }
 
-function loadFleet(db: Db): { idx: Map<string, string[]>; trust: Map<string, Trust> } {
+function loadFleet(db: Db): Pick<FleetCacheEntry, "idx" | "idxAny" | "trust" | "gone"> {
   const idx = new Map<string, string[]>();
-  for (const r of db.prepare("SELECT team_id, member_key FROM fleet_members").all()) {
-    const k = String(r.member_key);
-    const list = idx.get(k) ?? [];
-    list.push(String(r.team_id));
-    idx.set(k, list);
+  const idxAny = new Map<string, string[]>();
+  for (const r of db.prepare("SELECT team_id, member_key, active FROM fleet_members").all()) {
+    add(idxAny, String(r.member_key), String(r.team_id));
+    if (Number(r.active) === 1) add(idx, String(r.member_key), String(r.team_id));
   }
   const trust = new Map<string, Trust>();
-  for (const r of db.prepare("SELECT member_key, trust FROM fleet_trust").all()) trust.set(String(r.member_key), String(r.trust) as Trust);
-  return { idx, trust };
+  const gone = new Set<string>();
+  for (const r of db.prepare("SELECT member_key, trust, gone FROM fleet_trust").all()) {
+    trust.set(String(r.member_key), String(r.trust) as Trust);
+    if (Number(r.gone) === 1) gone.add(String(r.member_key));
+  }
+  return { idx, idxAny, trust, gone };
 }

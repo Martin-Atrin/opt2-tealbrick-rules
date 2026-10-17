@@ -150,8 +150,10 @@ export const handlers = {
         claim,
         claimVerified: false,
         claimTeams: claimK ? (fx.teams.get(claimK) ?? []) : [],
+        claimTeamsAny: claimK ? (fx.teamsAny.get(claimK) ?? []) : [],
         callerTeams: input.call.caller.type === "agent" ? (fx.teams.get(`agent:${input.call.caller.id}`) ?? []) : [],
-        claimTrust: claimK ? (fx.trust.get(claimK) ?? null) : null,
+        callerTeamsAny: input.call.caller.type === "agent" ? (fx.teamsAny.get(`agent:${input.call.caller.id}`) ?? []) : [],
+        claimTrust: claim && fx.available ? ((claimK ? fx.trust.get(claimK) : undefined) ?? "unreviewed") : null,
         fleetAvailable: fx.available,
       };
       const v = evaluate(rules, facts);
@@ -162,8 +164,8 @@ export const handlers = {
         ruleId: v.rule?.id ?? null,
         ruleTitle: v.rule?.title ?? null,
         narrowing: v.narrowing,
-        teams: [...facts.claimTeams],
-        callerTeams: [...facts.callerTeams],
+        teams: [...new Set([...facts.claimTeams, ...facts.claimTeamsAny])],
+        callerTeams: [...new Set([...facts.callerTeams, ...facts.callerTeamsAny])],
         trust: facts.claimTrust,
         fleetAvailable: facts.fleetAvailable,
         steps: explain(rules, facts),

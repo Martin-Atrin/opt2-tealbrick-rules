@@ -14,7 +14,9 @@ const facts = (o: Partial<Omit<CallFacts, "caller" | "target">> & { effect?: str
   claim: o.claim ?? null,
   claimVerified: o.claimVerified ?? false,
   claimTeams: o.claimTeams ?? [],
+  claimTeamsAny: o.claimTeamsAny ?? o.claimTeams ?? [],
   callerTeams: o.callerTeams ?? [],
+  callerTeamsAny: o.callerTeamsAny ?? o.callerTeams ?? [],
   claimTrust: o.claimTrust ?? null,
   fleetAvailable: o.fleetAvailable ?? true,
 });
