@@ -1,0 +1,153 @@
+// Contract fleet.directory_feed/1 (C230, G-3, RUL-02): the frozen files, every fixture through the REAL reader (parseFeed:
+// vendored schema + normalizeHandle), the refusal path (error recorded, copy cleared, never a partial read) and the
+// quiet-on-good counterparts.
+import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { test } from "node:test";
+import { normalizeHandle } from "@opt2-tealbrick/manifest";
+import type { Json } from "@opt2-tealbrick/miniapp-sdk";
+import { OP } from "#kit";
+import { handlers } from "../src/app.ts";
+import { FEED_INVALID, parseFeed, syncFleet } from "../src/fleet.ts";
+import { fleetFacts, fleetState, fleetTeams } from "../src/store.ts";
+import { feed, migratedDb, OWNER, opCtx } from "./helpers.ts";
+
+const sha256 = (b: Buffer | string) => createHash("sha256").update(b).digest("hex");
+const file = (rel: string) => readFileSync(new URL(rel, import.meta.url));
+const FIXTURES = JSON.parse(file("./contracts/fleet.directory_feed.1.json").toString()) as {
+  valid: Json[];
+  invalid: { why: string; doc: Json }[];
+  invalidByNormalizeHandle: { why: string; doc: Json }[];
+};
+
+test("contract files are the byte copies named in PROVENANCE.md (quiet on good, fires on a changed byte); the runtime schema is the same bytes", () => {
+  const prov = file("./contracts/PROVENANCE.md").toString();
+  for (const f of ["./contracts/fleet.directory_feed.1.schema.json", "./contracts/fleet.directory_feed.1.json", "../src/contracts/fleet.directory_feed.1.schema.json"]) {
+    const bytes = file(f);
+    assert.ok(prov.includes(sha256(bytes)), `${f} does not match the sha256 in PROVENANCE.md`);
+    assert.ok(!prov.includes(sha256(Buffer.concat([bytes, Buffer.from(" ")]))), "a changed file would not match");
+  }
+  assert.ok(file("./contracts/fleet.directory_feed.1.schema.json").equals(file("../src/contracts/fleet.directory_feed.1.schema.json")));
+  assert.ok(prov.includes("spec-v0.1.42"));
+});
+
+test("fixtures: every valid doc is read, every invalid doc is refused, invalidByNormalizeHandle fails ONLY by the handle rule", () => {
+  assert.ok(FIXTURES.valid.length >= 3 && FIXTURES.invalid.length >= 7 && FIXTURES.invalidByNormalizeHandle.length >= 1);
+  for (const doc of FIXTURES.valid) assert.doesNotThrow(() => parseFeed(doc), JSON.stringify(doc).slice(0, 80));
+  for (const { why, doc } of FIXTURES.invalid) assert.throws(() => parseFeed(doc), { code: FEED_INVALID, message: /fleet\.directory_feed\/1/ }, why);
+  for (const { why, doc } of FIXTURES.invalidByNormalizeHandle) {
+    const handles = ((doc as { contacts: { handles: string[] }[] }).contacts ?? []).flatMap((c) => c.handles);
+    assert.ok(handles.some((h) => normalizeHandle(h) !== h), "the fixture breaks the normalizeHandle rule");
+    // the schema alone accepts it: the refusal comes from the handle rule and says so
+    assert.throws(() => parseFeed(doc), { code: FEED_INVALID, message: /not canonical/ }, why);
+  }
+});
+
+test("the first fixture maps as the contract says", () => {
+  const d = parseFeed(FIXTURES.valid[0]);
+  assert.equal(d.revision, 42);
+  const [team] = d.model.teams;
+  assert.deepEqual(team?.keys.sort(), [
+    "agent:agt_01M4TNVDHPXJGTHATZV5SVJHX9",
+    "contact:ct_anna",
+    "handle:buzz:npub180cvv07tjdrrgpa0j7j7tmnyl2yr6yr7l8j4s3evf6u64th6gkwsyjh6w6",
+    "handle:slack:U012ABCDEF",
+  ]);
+  assert.equal(team?.name, "Sales");
+  assert.equal(d.model.trust.get("contact:ct_anna"), "trusted");
+  assert.equal(parseFeed(FIXTURES.valid[1]).unchanged, true);
+});
+
+test("a feed answer that breaks the contract is a REFUSAL: error recorded, copy cleared, nothing partial read (RUL-02)", async () => {
+  const { db } = migratedDb();
+  let answer: unknown = feed();
+  const callApp = async () => ({ status: "ok" as const, output: answer });
+  await syncFleet(db, callApp);
+  assert.equal(fleetFacts(db).available, true);
+  assert.equal(fleetTeams(db).length, 2);
+  for (const { why, doc } of [...FIXTURES.invalid, ...FIXTURES.invalidByNormalizeHandle]) {
+    // a good copy first, then the broken answer
+    answer = feed();
+    await syncFleet(db, callApp);
+    assert.equal(fleetFacts(db).available, true, `quiet on good before: ${why}`);
+    answer = doc;
+    await syncFleet(db, callApp);
+    assert.equal(fleetFacts(db).available, false, `refusal: ${why}`);
+    assert.equal(fleetTeams(db).length, 0, "nothing of the broken answer, and nothing of the old copy, is read");
+    assert.equal(fleetFacts(db).trust.size, 0);
+    assert.match(String(fleetState(db).error), /^Governance feed refused: /);
+    assert.equal(fleetState(db).revision, null, "the next read is a full one");
+  }
+  // fleet_status shows it
+  const st = await run("fleetStatus", db, callApp as never);
+  assert.equal(st.available, false);
+  assert.match(st.error, /^Governance feed refused: /);
+  assert.deepEqual(st.teams, []);
+  // an answer with a good part and a bad handle is not read at all
+  answer = feed({ contacts: [{ id: "c1", kind: "person", status: "active", trust: "trusted", handles: ["slack:u012abcdef"] }] });
+  await syncFleet(db, callApp);
+  assert.equal(fleetTeams(db).length, 0);
+  // and a later good answer recovers
+  answer = feed();
+  await syncFleet(db, callApp);
+  assert.equal(fleetFacts(db).available, true);
+  assert.equal(fleetState(db).error, null);
+});
+
+test("'unchanged' is only believed for the revision that was asked about", async () => {
+  const { db } = migratedDb();
+  let answer: unknown = feed({ revision: 5 });
+  const callApp = async () => ({ status: "ok" as const, output: answer });
+  await syncFleet(db, callApp);
+  answer = { v: 1, revision: 5, unchanged: true };
+  await syncFleet(db, callApp);
+  assert.equal(fleetFacts(db).available, true, "quiet on good: asked 5, unchanged 5");
+  answer = { v: 1, revision: 9, unchanged: true };
+  await syncFleet(db, callApp);
+  assert.equal(fleetFacts(db).available, false, "asked 5, 'unchanged' for 9 is a broken answer");
+  assert.match(String(fleetState(db).error), /unchanged answered for revision 9, asked 5/);
+  // after the clear the next read is full: an 'unchanged' there has nothing to refer to
+  answer = { v: 1, revision: 9, unchanged: true };
+  await syncFleet(db, callApp);
+  assert.match(String(fleetState(db).error), /asked none/);
+});
+
+test("the feed's 503 feed_too_large is transient (the copy stays), a 403 is a refusal (the copy goes)", async () => {
+  const { db } = migratedDb();
+  let err: Record<string, unknown> | null = null;
+  const callApp = async () => {
+    if (err) throw Object.assign(new Error("x"), err);
+    return { status: "ok" as const, output: feed() };
+  };
+  await syncFleet(db, callApp);
+  err = { code: "feed_too_large", httpStatus: 503 };
+  await syncFleet(db, callApp);
+  assert.equal(fleetFacts(db).available, true);
+  assert.equal(fleetTeams(db).length, 2);
+  assert.match(String(fleetState(db).error), /feed_too_large/);
+  err = { code: "no_access", httpStatus: 403 };
+  await syncFleet(db, callApp);
+  assert.equal(fleetFacts(db).available, false);
+  assert.equal(fleetTeams(db).length, 0);
+});
+
+test("the companion op is called with sinceRevision once a read exists (and never an agent id)", async () => {
+  const { db } = migratedDb();
+  const seen: unknown[][] = [];
+  const callApp = async (...a: unknown[]) => {
+    seen.push(a);
+    return { status: "ok" as const, output: feed({ revision: 3 }) };
+  };
+  await syncFleet(db, callApp as never);
+  await syncFleet(db, async (...a: unknown[]) => {
+    seen.push(a);
+    return { status: "ok" as const, output: { v: 1, revision: 3, unchanged: true } };
+  });
+  assert.deepEqual(seen, [["fleet", "directory_feed", {}], ["fleet", "directory_feed", { sinceRevision: 3 }]]);
+});
+
+async function run(id: "fleetStatus", db: ReturnType<typeof migratedDb>["db"], callApp: never) {
+  const h = handlers[OP[id]] as unknown as { run: (i: unknown, c: unknown) => Promise<any> };
+  return h.run({}, opCtx(db, { type: "person", id: OWNER }, callApp));
+}

@@ -5,7 +5,7 @@ import { performance } from "node:perf_hooks";
 import { hookResponseProblem } from "@opt2-tealbrick/manifest";
 import type { Db, HookContext, HookHandler, HookRequest, Json } from "@opt2-tealbrick/miniapp-sdk";
 import { type CallFacts, type Claim, claimKey, evaluate, recorded, redactionsFor, type Verdict } from "./engine.ts";
-import { fleetIndex, liveRules, recordDecision } from "./store.ts";
+import { fleetFacts, liveRules, recordDecision } from "./store.ts";
 
 /** Rules' own answer budget, far below the bridge's 2 s hook limit: slower → refuse. */
 export const GATE_BUDGET_MS = 250;
@@ -30,13 +30,20 @@ export function claimOf(context: Record<string, unknown>): { claim: Claim | null
   return { claim: { kind, id }, verified: o.verified === true };
 }
 
-/** Facts for one hook call: caller, target, claim, and the claim's teams (local Fleet copy + live Fleet context facts). */
-export function factsOf(req: HookRequest, db: Db): CallFacts {
+/**
+ * Facts for one hook call: caller (and its teams), target, claim, and the claim's teams and trust (local Fleet copy + live
+ * Fleet context facts). `fleetAvailable` is false when the local copy cannot be relied on (see `fleetFacts`).
+ */
+export function factsOf(req: HookRequest, db: Db, now = Date.now()): CallFacts {
   const ctx = (req.context ?? {}) as Record<string, unknown>;
   const { claim, verified } = claimOf(ctx);
+  const fx = fleetFacts(db, now);
   const teams = new Set<string>();
+  let claimTrust: CallFacts["claimTrust"] = null;
   if (claim) {
-    for (const t of fleetIndex(db).get(claimKey(claim)) ?? []) teams.add(t);
+    const key = claimKey(claim);
+    for (const t of (key ? fx.teams.get(key) : undefined) ?? []) teams.add(t);
+    claimTrust = (key ? fx.trust.get(key) : undefined) ?? null;
     // Fleet's context hook (order -100) runs before ours in the context phase; its live facts can only add teams,
     // and team rules can only narrow, so a union never widens.
     const live = ctx["fleet.requesterTeams"];
@@ -48,6 +55,9 @@ export function factsOf(req: HookRequest, db: Db): CallFacts {
     claim,
     claimVerified: verified,
     claimTeams: [...teams],
+    callerTeams: req.call.caller.type === "agent" ? (fx.teams.get(`agent:${req.call.caller.id}`) ?? []) : [],
+    claimTrust,
+    fleetAvailable: fx.available,
   };
 }
 
@@ -86,7 +96,8 @@ export function makeHooks(product: string, opts: { budgetMs?: number; holdSuppor
       const v = evaluate(liveRules(ctx.db), facts);
       const { answer, answered } = gateAnswer(v, opts.holdSupported ?? HOLD_SUPPORTED);
       if (ctx.signal.aborted || clock() - t0 > budget) throw new Error("gate budget exceeded");
-      if (recorded(facts, v)) recordDecision(ctx.db, { callId: req.call.id, phase: "before", facts, decision: v.decision, answered, reason: v.reason, rule: v.rule, durationUs: elapsedUs(t0) });
+      if (recorded(facts, v))
+        recordDecision(ctx.db, { callId: req.call.id, phase: "before", facts, decision: v.decision, answered, reason: v.reason, rule: v.rule, ...(v.closedOnFleet ? { detail: { fleetUnavailable: true } } : {}), durationUs: elapsedUs(t0) });
       return answer;
     } catch (e) {
       ctx.log.warn("rules_gate refused (fail closed)", { error: e instanceof Error ? e.message : "unknown", call: req.call.id });

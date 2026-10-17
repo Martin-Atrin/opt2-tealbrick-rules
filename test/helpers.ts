@@ -59,13 +59,48 @@ export function hookReq(
   } as unknown as HookRequest;
 }
 
+/** A valid fleet.directory_feed/1 answer (full): team tm_x with an agent, an active contact, a departed contact, a blocked contact and a removed agent. */
+export const NPUB = "buzz:npub180cvv07tjdrrgpa0j7j7tmnyl2yr6yr7l8j4s3evf6u64th6gkwsyjh6w6";
+export const AGENT_R = "agt_01J0000000000000000000000R";
+export function feed(over: Record<string, unknown> = {}): Record<string, Json> {
+  return {
+    v: 1,
+    revision: 7,
+    teams: [
+      {
+        id: "tm_x",
+        name: "Team X",
+        members: [
+          { kind: "agent", id: AGENT_A, role: "lead" },
+          { kind: "agent", id: AGENT_R, role: "member" },
+          { kind: "contact", id: "ct_anna", role: "member" },
+          { kind: "contact", id: "ct_gone", role: "member" },
+          { kind: "contact", id: "ct_block", role: "member" },
+        ],
+      },
+      { id: "tm_y", members: [{ kind: "agent", id: AGENT_B, role: "member" }] },
+    ],
+    contacts: [
+      { id: "ct_anna", kind: "person", status: "active", trust: "trusted", handles: ["slack:U777", NPUB] },
+      { id: "ct_gone", kind: "person", status: "departed", trust: "trusted", handles: ["telegram:9"] },
+      { id: "ct_block", kind: "outside_agent", status: "active", trust: "blocked", handles: ["slack:U666"] },
+    ],
+    agents: [
+      { id: AGENT_A, status: "active", trust: "trusted", owner: "ct_anna" },
+      { id: AGENT_B, status: "paused", trust: "unreviewed", owner: null },
+      { id: AGENT_R, status: "removed", trust: "blocked", owner: null },
+    ],
+    ...over,
+  } as Record<string, Json>;
+}
+
 export function spec(o: Partial<RuleSpec> & { decision?: RuleSpec["outcome"]["decision"]; reason?: string }): RuleSpec {
   const { decision, reason, ...rest } = o;
   return { title: "rule", active: true, priority: 100, match: {}, outcome: { decision: decision ?? "deny", reason: reason ?? "not allowed" }, ...rest };
 }
 
 /** Minimal OpContext for handler tests (person or agent caller). */
-export function opCtx(db: Db, caller: { type: "person" | "agent"; id: string; name?: string; mode?: "free" | "bound" | null }, callApp?: OpContext["callApp"]): OpContext {
+export function opCtx(db: Db, caller: { type: "person" | "agent" | "app"; id: string; name?: string; mode?: "free" | "bound" | null }, callApp?: OpContext["callApp"]): OpContext {
   const meta: Json[] = [];
   return {
     db,

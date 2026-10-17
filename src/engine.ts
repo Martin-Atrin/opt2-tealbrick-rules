@@ -7,7 +7,11 @@
 // - No matching rule = allow (C84). Free/Bound caps and held families stay the floor in the target app.
 // - An `onBehalfOf` claim that is not verified may only NARROW (C82): the decision is the stricter of the
 //   evaluation with the claim and the evaluation without any claim-dependent rule; narrowing lists are merged.
-import { normalizeTag, tagsMatch } from "@opt2-tealbrick/manifest";
+// - Fleet facts (teams of the caller or of the claimed requester, trust of the claimed requester) come from the local
+//   Fleet read model. When that copy is unavailable (never read, refused, too old) a DENY or HOLD rule that names Fleet
+//   facts APPLIES (the criterion counts as met) and an ALLOW rule that names them does NOT apply: the gap can only make
+//   a decision stricter (C230, G-3, fail closed).
+import { normalizeTag, normalizeHandle as sharedNormalizeHandle, tagsMatch } from "@opt2-tealbrick/manifest";
 import type { RulesSetInputRuleSpec } from "#kit";
 
 export type RuleSpec = RulesSetInputRuleSpec;
@@ -28,6 +32,10 @@ export interface Rule {
   updatedAt: number;
 }
 
+/** Trust states of a contact (contract fleet.directory_feed/1). */
+export const TRUSTS = ["unreviewed", "trusted", "limited", "blocked"] as const;
+export type Trust = (typeof TRUSTS)[number];
+
 export interface Claim {
   kind: "person" | "agent" | "channel_sender";
   id: string;
@@ -42,6 +50,12 @@ export interface CallFacts {
   claimVerified: boolean;
   /** team ids the claim resolves to (Fleet read model plus live Fleet context facts) */
   claimTeams: readonly string[];
+  /** team ids of the CALLER agent (Fleet read model) */
+  callerTeams: readonly string[];
+  /** trust of the claimed requester (Fleet read model, contact found by contact id or canonical handle), or null if unknown */
+  claimTrust: Trust | null;
+  /** false = the Fleet read model cannot be relied on (never read, refused, too old): see the header */
+  fleetAvailable: boolean;
 }
 
 export interface Narrowing {
@@ -56,6 +70,8 @@ export interface Verdict {
   narrowing: Narrowing | null;
   /** true when the decisive rule matched through the onBehalfOf claim */
   viaClaim: boolean;
+  /** true when the decisive deny/hold rule applied only because the Fleet facts it names were unavailable */
+  closedOnFleet: boolean;
 }
 
 export interface Step {
@@ -67,30 +83,66 @@ export interface Step {
 
 const anyOf = (list: readonly string[] | undefined, value: string | null | undefined): boolean => !list || list.length === 0 || (value != null && list.includes(value));
 
-/** Why `rule` does not match `facts` ("" = it matches). `useClaim = false` makes every claim criterion fail. */
-export function mismatch(spec: RuleSpec, facts: CallFacts, useClaim = true): string {
-  if (!spec.active) return "inactive";
+/** Fleet facts a rule names: caller teams, claimed requester's teams or trust. */
+export function dependsOnFleet(spec: RuleSpec): boolean {
   const m = spec.match;
-  if (!anyOf(m.agents, facts.caller.id)) return "caller is not listed";
-  if (!anyOf(m.modes, facts.caller.mode)) return "caller mode differs";
-  if (!anyOf(m.products, facts.target.product)) return "target product differs";
-  if (!anyOf(m.operations, facts.target.op)) return "target operation differs";
-  if (!anyOf(m.effects, facts.target.effect)) return "effect differs";
-  const obo = m.onBehalfOf;
-  if (obo && ((obo.teams?.length ?? 0) > 0 || (obo.ids?.length ?? 0) > 0 || (obo.kinds?.length ?? 0) > 0)) {
-    if (!useClaim) return "needs an on-behalf-of claim (claims only narrow)";
-    const c = facts.claim;
-    if (!c) return "no on-behalf-of claim";
-    if (!anyOf(obo.kinds, c.kind)) return "claim kind differs";
-    if (obo.ids?.length && !obo.ids.includes(c.id) && !obo.ids.includes(normalizeHandle(c.id))) return "claimed requester is not listed";
-    if (obo.teams?.length && !obo.teams.some((t) => facts.claimTeams.includes(t))) return "claimed requester is not in the teams";
-  }
-  return "";
+  return (m.callerTeams?.length ?? 0) > 0 || (m.onBehalfOf?.teams?.length ?? 0) > 0 || (m.onBehalfOf?.trust?.length ?? 0) > 0;
 }
 
 export function dependsOnClaim(spec: RuleSpec): boolean {
   const o = spec.match.onBehalfOf;
-  return !!o && ((o.teams?.length ?? 0) > 0 || (o.ids?.length ?? 0) > 0 || (o.kinds?.length ?? 0) > 0);
+  return !!o && ((o.teams?.length ?? 0) > 0 || (o.ids?.length ?? 0) > 0 || (o.kinds?.length ?? 0) > 0 || (o.trust?.length ?? 0) > 0);
+}
+
+export const NEEDS_FLEET = "needs Fleet facts, which are unavailable (allow rules do not apply without them)";
+
+/**
+ * Why `rule` does not match `facts` ("" = it matches), and whether it matches only because the Fleet facts it names are
+ * unavailable (`closed`, deny and hold rules only). `useClaim = false` makes every claim criterion fail.
+ */
+export function judge(spec: RuleSpec, facts: CallFacts, useClaim = true): { why: string; closed: boolean } {
+  const no = (why: string) => ({ why, closed: false });
+  if (!spec.active) return no("inactive");
+  const m = spec.match;
+  if (!anyOf(m.agents, facts.caller.id)) return no("caller is not listed");
+  if (!anyOf(m.modes, facts.caller.mode)) return no("caller mode differs");
+  if (!anyOf(m.products, facts.target.product)) return no("target product differs");
+  if (!anyOf(m.operations, facts.target.op)) return no("target operation differs");
+  if (!anyOf(m.effects, facts.target.effect)) return no("effect differs");
+  const strict = spec.outcome.decision !== "allow";
+  let closed = false;
+  // A Fleet criterion: met, not met, or (copy unavailable) met for a deny/hold rule and never met for an allow rule.
+  const fleet = (met: boolean, why: string): string => {
+    if (facts.fleetAvailable) return met ? "" : why;
+    if (!strict) return NEEDS_FLEET;
+    closed = true;
+    return "";
+  };
+  if (m.callerTeams?.length) {
+    const why = fleet(m.callerTeams.some((t) => facts.callerTeams.includes(t)), "caller is not in the teams");
+    if (why) return no(why);
+  }
+  if (dependsOnClaim(spec)) {
+    const obo = m.onBehalfOf as NonNullable<RuleSpec["match"]["onBehalfOf"]>;
+    if (!useClaim) return no("needs an on-behalf-of claim (claims only narrow)");
+    const c = facts.claim;
+    if (!c) return no("no on-behalf-of claim");
+    if (!anyOf(obo.kinds, c.kind)) return no("claim kind differs");
+    if (obo.ids?.length && !obo.ids.includes(c.id) && !obo.ids.includes(handleOf(c.id) ?? "")) return no("claimed requester is not listed");
+    if (obo.teams?.length) {
+      const why = fleet(obo.teams.some((t) => facts.claimTeams.includes(t)), "claimed requester is not in the teams");
+      if (why) return no(why);
+    }
+    if (obo.trust?.length) {
+      const why = fleet(facts.claimTrust !== null && obo.trust.includes(facts.claimTrust), "claimed requester's trust is not listed");
+      if (why) return no(why);
+    }
+  }
+  return { why: "", closed };
+}
+
+export function mismatch(spec: RuleSpec, facts: CallFacts, useClaim = true): string {
+  return judge(spec, facts, useClaim).why;
 }
 
 /** Evaluation order: priority ascending, then newest update, then id. */
@@ -98,13 +150,17 @@ export function order(rules: readonly Rule[]): Rule[] {
   return [...rules].sort((a, b) => a.spec.priority - b.spec.priority || b.updatedAt - a.updatedAt || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
 }
 
-function firstMatch(ordered: readonly Rule[], facts: CallFacts, useClaim: boolean): Rule | null {
-  for (const r of ordered) if (mismatch(r.spec, facts, useClaim) === "") return r;
+function firstMatch(ordered: readonly Rule[], facts: CallFacts, useClaim: boolean): { rule: Rule; closed: boolean } | null {
+  for (const r of ordered) {
+    const j = judge(r.spec, facts, useClaim);
+    if (j.why === "") return { rule: r, closed: j.closed };
+  }
   return null;
 }
 
-function verdictOf(rule: Rule | null): Verdict {
-  if (!rule) return { decision: "allow", reason: NO_MATCH_REASON, rule: null, narrowing: null, viaClaim: false };
+function verdictOf(hit: { rule: Rule; closed: boolean } | null): Verdict {
+  if (!hit) return { decision: "allow", reason: NO_MATCH_REASON, rule: null, narrowing: null, viaClaim: false, closedOnFleet: false };
+  const rule = hit.rule;
   const n = rule.spec.outcome.decision === "allow" ? normNarrowing(rule.spec.narrowing) : null;
   return {
     decision: rule.spec.outcome.decision,
@@ -112,6 +168,7 @@ function verdictOf(rule: Rule | null): Verdict {
     rule: { id: rule.id, rev: rule.rev, title: rule.spec.title },
     narrowing: n,
     viaClaim: dependsOnClaim(rule.spec),
+    closedOnFleet: hit.closed,
   };
 }
 
@@ -152,8 +209,8 @@ export function evaluate(ordered: readonly Rule[], facts: CallFacts): Verdict {
 /** Per-rule explanation for the dry run. */
 export function explain(ordered: readonly Rule[], facts: CallFacts): Step[] {
   return ordered.map((r) => {
-    const why = mismatch(r.spec, facts, true);
-    return { ruleId: r.id, title: r.spec.title, matched: why === "", why: why || "matches" };
+    const j = judge(r.spec, facts, true);
+    return { ruleId: r.id, title: r.spec.title, matched: j.why === "", why: j.why || (j.closed ? "matches: Fleet facts are unavailable, so this rule applies (fail closed)" : "matches") };
   });
 }
 
@@ -200,24 +257,23 @@ export function redactionsFor(output: unknown, n: Narrowing): string[] {
 }
 
 /**
- * One handle format (Fleet contract): "<channel>:<value>", channel ∈ buzz|slack|telegram; a bare npub is buzz;
- * buzz values lower case, slack ids upper case.
+ * The canonical handle of a claim id, or null (G-4: the ONE shared `normalizeHandle` of @opt2-tealbrick/manifest; null
+ * means "no match", never the raw input).
  */
-export function normalizeHandle(h: string): string {
-  const s = h.trim();
-  if (/^npub1[0-9a-z]+$/i.test(s)) return `buzz:${s.toLowerCase()}`;
-  const i = s.indexOf(":");
-  if (i < 0) return s;
-  const ch = s.slice(0, i).toLowerCase();
-  const val = s.slice(i + 1).trim();
-  if (ch === "buzz") return `buzz:${val.toLowerCase()}`;
-  if (ch === "slack") return `slack:${val.toUpperCase()}`;
-  return `${ch}:${val}`;
+export function handleOf(id: string): string | null {
+  return sharedNormalizeHandle(id);
 }
 
-/** Fleet member key for a claim (person:<id>, agent:<id>, handle:<handle>). */
-export function claimKey(c: Claim): string {
-  return c.kind === "channel_sender" ? `handle:${normalizeHandle(c.id)}` : `${c.kind}:${c.id}`;
+/**
+ * Fleet member key for a claim: `contact:<id>` (a person claim names a directory contact), `agent:<id>`,
+ * `handle:<canonical handle>`. A channel sender whose id is not a valid handle has no key (null).
+ */
+export function claimKey(c: Claim): string | null {
+  if (c.kind === "channel_sender") {
+    const h = handleOf(c.id);
+    return h ? `handle:${h}` : null;
+  }
+  return c.kind === "person" ? `contact:${c.id}` : `agent:${c.id}`;
 }
 
 /** Problems a JSON schema cannot express. "" = fine. */
