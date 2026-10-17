@@ -33,9 +33,9 @@ import {
   type RulesSetOutput,
 } from "#kit";
 import { catalogOf, catalogState, ensureCatalog, opTitles, type SyncOptions, startCatalogTimer } from "./catalog.ts";
-import { type CallFacts, claimKey, evaluate, explain, order, type Rule, type RuleSpec } from "./engine.ts";
-import { type CallApp, refreshIfStale, startFleetTimer, syncFleet } from "./fleet.ts";
-import { gateAnswer, HOLD_SUPPORTED, makeHooks } from "./hooks.ts";
+import { type CallFacts, evaluate, explain, order, type Rule, type RuleSpec } from "./engine.ts";
+import { type CallApp, refreshIfStale, startFleetTimer, strictest, syncFleet } from "./fleet.ts";
+import { claimFleetFacts, gateAnswer, HOLD_SUPPORTED, makeHooks } from "./hooks.ts";
 import {
   type DraftView,
   decideDraft,
@@ -143,17 +143,14 @@ export const handlers = {
       const rules: Rule[] = order([...liveRules(ctx.db), ...(input.candidate ? [{ id: "candidate", rev: 0, spec: input.candidate, updatedAt: Date.now() }] : [])]);
       const claim = input.call.onBehalfOf ?? null;
       const fx = fleetFacts(ctx.db);
-      const claimK = claim ? claimKey(claim) : null;
       const facts: CallFacts = {
         caller: { type: input.call.caller.type, id: input.call.caller.id, mode: input.call.caller.mode ?? null },
         target: { ...input.call.target },
         claim,
         claimVerified: false,
-        claimTeams: claimK ? (fx.teams.get(claimK) ?? []) : [],
-        claimTeamsAny: claimK ? (fx.teamsAny.get(claimK) ?? []) : [],
+        ...claimFleetFacts(fx, claim),
         callerTeams: input.call.caller.type === "agent" ? (fx.teams.get(`agent:${input.call.caller.id}`) ?? []) : [],
         callerTeamsAny: input.call.caller.type === "agent" ? (fx.teamsAny.get(`agent:${input.call.caller.id}`) ?? []) : [],
-        claimTrust: claim && fx.available ? ((claimK ? fx.trust.get(claimK) : undefined) ?? "unreviewed") : null,
         fleetAvailable: fx.available,
       };
       const v = evaluate(rules, facts);
@@ -166,7 +163,7 @@ export const handlers = {
         narrowing: v.narrowing,
         teams: [...new Set([...facts.claimTeams, ...facts.claimTeamsAny])],
         callerTeams: [...new Set([...facts.callerTeams, ...facts.callerTeamsAny])],
-        trust: facts.claimTrust,
+        trust: facts.claimTrusts.length ? facts.claimTrusts.reduce(strictest) : null,
         fleetAvailable: facts.fleetAvailable,
         steps: explain(rules, facts),
       };

@@ -29,7 +29,7 @@ const ruleCache = new WeakMap<Db, Rule[]>();
 interface FleetCacheEntry {
   idx: Map<string, string[]>;
   idxAny: Map<string, string[]>;
-  trust: Map<string, Trust>;
+  trust: Map<string, TrustEntry>;
   gone: Set<string>;
   okAt: number | null;
   usable: boolean;
@@ -276,7 +276,7 @@ let inserts = 0;
 
 export function recordDecision(db: Db, t: TraceInput, now = Date.now()): string {
   const id = `dec_${ulid(now)}`;
-  const obo = t.facts.claim ? JSON.stringify({ ...t.facts.claim, verified: t.facts.claimVerified, teams: t.facts.claimTeams, trust: t.facts.claimTrust }) : null;
+  const obo = t.facts.claim ? JSON.stringify({ ...t.facts.claim, verified: t.facts.claimVerified, teams: t.facts.claimTeams, trust: t.facts.claimTrusts }) : null;
   db.prepare(
     "INSERT INTO decisions (id, call_id, phase, at, caller_type, caller_id, caller_mode, product, op, effect, decision, answered, reason, rule_id, rule_rev, rule_title, on_behalf_of, detail, duration_us) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
   ).run(
@@ -377,10 +377,11 @@ export interface FleetTeam {
   activeKeys: string[];
 }
 
+/** Everyone who holds one key (a handle can be held by several contacts): the SET of their raw trust values, and whether all are active. */
 export interface TrustEntry {
-  trust: Trust;
-  /** every contact or agent behind the key is blocked, departed or removed */
-  gone: boolean;
+  trusts: Trust[];
+  /** false when any holder is blocked, departed or removed (a gone holder never satisfies an allow rule by trust) */
+  allActive: boolean;
 }
 
 /** One read of the feed, mapped: teams with member keys, and the trust of each contact key (contact:<id>, handle:<h>). */
@@ -399,15 +400,28 @@ export interface FleetSyncState {
   usable: boolean;
 }
 
+/** An error that could not be written to the database (it is broken); shown by fleet_status until the next good write. */
+const memoryError = new WeakMap<Db, string>();
+
 export function fleetState(db: Db): FleetSyncState {
   const r = db.prepare("SELECT revision, synced_at, stale, error, usable FROM fleet_sync WHERE id = 1").get();
+  const mem = memoryError.get(db);
   return {
     revision: r?.revision == null ? null : Number(r.revision),
     syncedAt: r?.synced_at == null ? null : Number(r.synced_at),
-    stale: Number(r?.stale ?? 1) === 1,
-    error: r?.error == null ? null : String(r.error),
-    usable: Number(r?.usable ?? 0) === 1,
+    stale: mem !== undefined || Number(r?.stale ?? 1) === 1,
+    error: mem ?? (r?.error == null ? null : String(r.error)),
+    usable: mem === undefined && Number(r?.usable ?? 0) === 1,
   };
+}
+
+/**
+ * Last resort when the database refuses the write that clears the copy: drop the in-memory copy so the gate sees the Fleet
+ * facts as unavailable (fail closed) and keep the error in memory. Never throws.
+ */
+export function dropFleetCopy(db: Db, error: string): void {
+  memoryError.set(db, error.slice(0, 280));
+  fleetCache.set(db, { idx: new Map(), idxAny: new Map(), trust: new Map(), gone: new Set(), okAt: null, usable: false });
 }
 
 /** Set the stale flag without counting it (a sync re-arming itself). */
@@ -446,6 +460,7 @@ function* writeSteps(db: Db, model: FleetModel | null, state: { revision: number
       if (state.error === null) db.prepare("UPDATE fleet_sync SET revision = ?, synced_at = ?, stale = 0, error = NULL, usable = 1 WHERE id = 1").run(state.revision, now);
       else db.prepare("UPDATE fleet_sync SET error = ? WHERE id = 1").run(state.error);
     });
+    if (state.error === null) memoryError.delete(db);
     // an "unchanged" answer moves the read time; a transient error changes nothing the gate uses
     const hit = fleetCache.get(db);
     if (state.error === null) {
@@ -460,10 +475,10 @@ function* writeSteps(db: Db, model: FleetModel | null, state: { revision: number
   });
   const idx = new Map<string, string[]>();
   const idxAny = new Map<string, string[]>();
-  const trust = new Map<string, Trust>();
+  const trust = new Map<string, TrustEntry>();
   const gone = new Set<string>();
   const m = db.prepare("INSERT OR IGNORE INTO fleet_members (team_id, member_key, active) VALUES (?, ?, ?)");
-  const tr = db.prepare("INSERT OR REPLACE INTO fleet_trust (member_key, trust, gone) VALUES (?, ?, ?)");
+  const tr = db.prepare("INSERT OR REPLACE INTO fleet_trust (member_key, trusts, all_active) VALUES (?, ?, ?)");
   let batch: (() => void)[] = [];
   function* flush(force: boolean): Generator<void, void, void> {
     if (batch.length === 0 || (!force && batch.length < FLEET_WRITE_CHUNK_ROWS)) return;
@@ -485,9 +500,9 @@ function* writeSteps(db: Db, model: FleetModel | null, state: { revision: number
     }
   }
   for (const [k, v] of model.trust) {
-    trust.set(k, v.trust);
-    if (v.gone) gone.add(k);
-    batch.push(() => tr.run(k, v.trust, v.gone ? 1 : 0));
+    trust.set(k, v);
+    if (!v.allActive) gone.add(k);
+    batch.push(() => tr.run(k, [...v.trusts].sort().join(","), v.allActive ? 1 : 0));
     yield* flush(false);
   }
   yield* flush(true);
@@ -499,6 +514,7 @@ function* writeSteps(db: Db, model: FleetModel | null, state: { revision: number
     else db.prepare("UPDATE fleet_sync SET revision = NULL, stale = 1, error = ?, usable = 0 WHERE id = 1").run(state.error);
   });
   const usable = state.error === null;
+  if (usable) memoryError.delete(db);
   fleetCache.set(db, { idx, idxAny, trust, gone, okAt: usable ? now : fleetState(db).syncedAt, usable });
 }
 
@@ -535,9 +551,9 @@ export interface FleetFacts {
   teams: Map<string, string[]>;
   /** member key → team ids, EVERY membership incl. blocked, departed, removed (deny and hold rules) */
   teamsAny: Map<string, string[]>;
-  /** contact/agent key (`contact:<id>`, `handle:<h>`, `agent:<id>`) → trust; a key that is missing is `unreviewed` */
-  trust: Map<string, Trust>;
-  /** keys whose every contact/agent is blocked, departed or removed */
+  /** contact/agent key (`contact:<id>`, `handle:<h>`, `agent:<id>`) → its holders' trust set; a key that is missing is `unreviewed` */
+  trust: Map<string, TrustEntry>;
+  /** keys with at least one holder that is blocked, departed or removed */
   gone: Set<string>;
 }
 
@@ -572,11 +588,12 @@ function loadFleet(db: Db): Pick<FleetCacheEntry, "idx" | "idxAny" | "trust" | "
     add(idxAny, String(r.member_key), String(r.team_id));
     if (Number(r.active) === 1) add(idx, String(r.member_key), String(r.team_id));
   }
-  const trust = new Map<string, Trust>();
+  const trust = new Map<string, TrustEntry>();
   const gone = new Set<string>();
-  for (const r of db.prepare("SELECT member_key, trust, gone FROM fleet_trust").all()) {
-    trust.set(String(r.member_key), String(r.trust) as Trust);
-    if (Number(r.gone) === 1) gone.add(String(r.member_key));
+  for (const r of db.prepare("SELECT member_key, trusts, all_active FROM fleet_trust").all()) {
+    const k = String(r.member_key);
+    trust.set(k, { trusts: String(r.trusts).split(",") as Trust[], allActive: Number(r.all_active) === 1 });
+    if (Number(r.all_active) !== 1) gone.add(k);
   }
   return { idx, idxAny, trust, gone };
 }

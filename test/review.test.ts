@@ -10,7 +10,7 @@ import { type CallFacts, evaluate, type Narrowing, order, type Rule, type Trust 
 import { FEED_INVALID, parseFeed, strictest, syncFleet } from "../src/fleet.ts";
 import { makeHooks, PIN_MAX, PIN_TTL_MS, pinnedNarrowing, pinVerdict } from "../src/hooks.ts";
 import { FLEET_WRITE_CHUNK_ROWS, fleetFacts, fleetState, listDecisions, markFleetStale, saveRule, writeFleetChunked } from "../src/store.ts";
-import { AGENT_A, AGENT_B, AGENT_R, feed, hookCtx, hookReq, migratedDb, NPUB, OWNER, opCtx, spec } from "./helpers.ts";
+import { AGENT_A, AGENT_B, AGENT_R, feed, hookCtx, hookReq, migratedDb, NPUB, OWNER, opCtx, spec, trustFacts } from "./helpers.ts";
 
 type Db = ReturnType<typeof migratedDb>["db"];
 const hooks = makeHooks("rules");
@@ -20,7 +20,7 @@ const gate = (db: Db, o: Record<string, unknown> = {}) => call("rules_gate", hoo
 const sync = (db: Db, doc: Record<string, Json> = feed()) => syncFleet(db, async () => ({ status: "ok" as const, output: doc }));
 const allowed = (r: Record<string, any>) => r.allow === true;
 const rule = (id: string, s: Rule["spec"]): Rule => ({ id, rev: 1, spec: s, updatedAt: 1 });
-const facts = (o: Partial<CallFacts> = {}): CallFacts => ({
+const facts = (o: Partial<CallFacts> & { claimTrust?: Trust | null } = {}): CallFacts => ({
   caller: { type: "agent", id: AGENT_A, mode: "free" },
   target: { product: "knowledge", op: "memory_recall", effect: "read" },
   claim: null,
@@ -29,9 +29,9 @@ const facts = (o: Partial<CallFacts> = {}): CallFacts => ({
   claimTeamsAny: [],
   callerTeams: [],
   callerTeamsAny: [],
-  claimTrust: null,
   fleetAvailable: true,
   ...o,
+  ...trustFacts(o),
 });
 const shape = (v: ReturnType<typeof evaluate>) => ({ decision: v.decision, rule: v.rule?.id ?? null, narrowing: v.narrowing, closedOnFleet: v.closedOnFleet });
 const WORK: Narrowing = { memoryTags: { anyOf: ["work"] } };
@@ -131,16 +131,16 @@ test("missing trust = unreviewed: unknown handle, unknown contact id, departed+t
   assert.equal(await via("channel_sender", "slack:u999"), "hold", "unknown handle");
   assert.equal(await via("person", "ct_nobody"), "hold", "unknown contact id");
   assert.equal(await via("channel_sender", "not-a-handle"), "hold", "an id that is no handle");
-  assert.equal(await via("person", "ct_gone"), "hold", "departed + trusted becomes unreviewed");
+  assert.equal(await via("person", "ct_gone"), "allow", "departed + trusted: deny/hold rules keep the RAW trust (trusted), so a hold for unreviewed does not apply");
   assert.equal(await via("agent", AGENT_B), "hold", "an unreviewed agent");
   assert.equal(await via("agent", "agt_01J000000000000000000000ZZ"), "hold", "an agent the producer left out");
   assert.equal(await via("agent", AGENT_R), "deny", "a removed agent keeps a restrictive trust (blocked)");
   assert.equal(await via("channel_sender", "slack:u666"), "deny", "blocked contact");
   const t = parseFeed(feed()).model.trust;
-  assert.deepEqual(t.get("contact:ct_gone"), { trust: "unreviewed", gone: true });
-  assert.deepEqual(t.get(`agent:${AGENT_A}`), { trust: "trusted", gone: false });
-  assert.deepEqual(t.get(`agent:${AGENT_R}`), { trust: "blocked", gone: true });
-  assert.deepEqual(t.get("contact:ct_block"), { trust: "blocked", gone: true });
+  assert.deepEqual(t.get("contact:ct_gone"), { trusts: ["trusted"], allActive: false });
+  assert.deepEqual(t.get(`agent:${AGENT_A}`), { trusts: ["trusted"], allActive: true });
+  assert.deepEqual(t.get(`agent:${AGENT_R}`), { trusts: ["blocked"], allActive: false });
+  assert.deepEqual(t.get("contact:ct_block"), { trusts: ["blocked"], allActive: false });
   // the dry run says what the gate saw
   const owner = opCtx(db, { type: "person", id: OWNER }, (async () => ({ status: "ok", output: feed() })) as never);
   const p = await (handlers[OP.rulesPreview] as unknown as { run: (i: unknown, c: unknown) => Promise<any> }).run({ call: { caller: { type: "agent", id: AGENT_A }, target: { product: "connect", op: "buzz_dm", effect: "outward" }, onBehalfOf: { kind: "channel_sender", id: "slack:u999" } } }, owner);
@@ -168,7 +168,7 @@ const SETS = (): Record<string, Json> =>
       { id: "ct_anna", kind: "person", status: "active", trust: "trusted", handles: ["slack:U777"] },
       { id: "ct_old", kind: "person", status: "departed", trust: "trusted", handles: ["slack:U555", "slack:U777"] },
       { id: "ct_block", kind: "person", status: "active", trust: "blocked", handles: ["slack:U666"] },
-      { id: "ct_active_same", kind: "person", status: "active", trust: "trusted", handles: ["slack:U555"] },
+      { id: "ct_active_same", kind: "person", status: "active", trust: "trusted", handles: ["slack:U555", "slack:U556"] },
     ],
     agents: [
       { id: AGENT_A, status: "active", trust: "trusted", owner: null },
@@ -181,8 +181,10 @@ test("two key sets: deny/hold see every member (blocked, departed, removed); all
   assert.ok(m);
   assert.ok(m.keys.includes("contact:ct_old") && m.keys.includes("contact:ct_block") && m.keys.includes(`agent:${AGENT_R}`) && m.keys.includes("handle:slack:U666"));
   assert.ok(!m.activeKeys.includes("contact:ct_old") && !m.activeKeys.includes("contact:ct_block") && !m.activeKeys.includes(`agent:${AGENT_R}`) && !m.activeKeys.includes("handle:slack:U666"));
-  assert.ok(m.activeKeys.includes("handle:slack:U777"), "an active contact keeps a handle it shares with a departed one");
-  assert.ok(m.activeKeys.includes("handle:slack:U555"));
+  // a handle held by an active AND a departed contact is ambiguous: deny/hold see it, allow never does (EVERY holder must be active)
+  assert.ok(m.keys.includes("handle:slack:U777") && !m.activeKeys.includes("handle:slack:U777"));
+  assert.ok(m.keys.includes("handle:slack:U555") && !m.activeKeys.includes("handle:slack:U555"));
+  assert.ok(m.activeKeys.includes("handle:slack:U556") && m.activeKeys.includes("contact:ct_active_same") && m.activeKeys.includes("contact:ct_anna"));
   assert.ok(m.activeKeys.includes(`agent:${AGENT_A}`));
   const { db: dDeny } = migratedDb();
   const { db: dAllow } = migratedDb();
@@ -202,9 +204,9 @@ test("two key sets: deny/hold see every member (blocked, departed, removed); all
   saveRule(dAllow, { spec: spec({ priority: 1, match: { effects: ["outward"], callerTeams: ["tm_x"] }, decision: "allow", reason: "X callers may" }), actor: OWNER });
   saveRule(dAllow, { spec: spec({ priority: 9, match: { effects: ["outward"] }, decision: "deny", reason: "default no" }), actor: OWNER });
   await sync(dAllow, SETS());
-  for (const [kind, id] of [["person", "ct_old"], ["person", "ct_block"], ["channel_sender", "slack:u666"]] as const) assert.equal(allowed(await dn(dAllow, claimCtx(kind, id))), false, `allow does not widen for ${id}`);
+  for (const [kind, id] of [["person", "ct_old"], ["person", "ct_block"], ["channel_sender", "slack:u666"], ["channel_sender", "slack:u777"], ["channel_sender", "slack:u555"]] as const) assert.equal(allowed(await dn(dAllow, claimCtx(kind, id))), false, `allow does not widen for ${id}`);
   assert.equal(allowed(await dn(dAllow, {}, AGENT_R)), false, "a removed agent as caller gets no allow");
-  for (const [kind, id] of [["person", "ct_anna"], ["channel_sender", "slack:u777"], ["channel_sender", "slack:u555"], ["person", "ct_active_same"]] as const) assert.equal(allowed(await dn(dAllow, claimCtx(kind, id))), true, `quiet: ${id} counts`);
+  for (const [kind, id] of [["person", "ct_anna"], ["channel_sender", "slack:u556"], ["person", "ct_active_same"]] as const) assert.equal(allowed(await dn(dAllow, claimCtx(kind, id))), true, `quiet: ${id} counts`);
   assert.equal(allowed(await dn(dAllow, {}, AGENT_A)), true, "quiet: an active agent");
   // paused agents count
   assert.deepEqual(fleetFacts(dAllow).teams.get(`agent:${AGENT_A}`), ["tm_x"]);
@@ -261,13 +263,13 @@ test("200 teams x 350 members: every write transaction stays well under 50 ms an
     }
   };
   const teams = [];
-  const trust = new Map<string, { trust: Trust; gone: boolean }>();
+  const trust = new Map<string, { trusts: Trust[]; allActive: boolean }>();
   for (let t = 0; t < 200; t++) {
     const keys: string[] = [];
     for (let m = 0; m < 350; m++) {
       const n = t * 350 + m;
       keys.push(`contact:ct_${n}`, `handle:slack:U${n}`);
-      trust.set(`contact:ct_${n}`, { trust: "trusted", gone: false });
+      trust.set(`contact:ct_${n}`, { trusts: ["trusted"], allActive: true });
     }
     teams.push({ id: `tm_${t}`, name: `T${t}`, people: 350, agents: 0, keys, activeKeys: keys });
   }
@@ -355,7 +357,7 @@ test("markFleetStale while a sync is in flight → one more sync (a full read); 
 });
 
 // ── 9. one monotone trust order ────────────────────────────────────────────────────────────────────────────────
-test("trust order blocked > limited > unreviewed > trusted: the stricter value wins, in any order, incl. shared handles", () => {
+test("trust order blocked > limited > unreviewed > trusted (strictest) is monotone and commutative", () => {
   const order4: Trust[] = ["trusted", "unreviewed", "limited", "blocked"];
   for (const [i, a] of order4.entries()) {
     for (const [j, b] of order4.entries()) {
@@ -363,12 +365,5 @@ test("trust order blocked > limited > unreviewed > trusted: the stricter value w
       assert.equal(strictest(a, b), strictest(b, a));
     }
   }
-  const handle = "slack:U321";
-  for (const combo of [["trusted", "limited"], ["limited", "trusted"], ["trusted", "unreviewed"], ["blocked", "trusted"], ["unreviewed", "blocked"]] as const) {
-    const doc = feed({ teams: [], agents: [], contacts: combo.map((trust, n) => ({ id: `c${n}`, kind: "person", status: "active", trust, handles: [handle] })) });
-    assert.equal(parseFeed(doc).model.trust.get(`handle:${handle}`)?.trust, order4[Math.max(...combo.map((c) => order4.indexOf(c)))], combo.join("+"));
-  }
-  const gone = parseFeed(feed({ teams: [], agents: [], contacts: [{ id: "a", kind: "person", status: "departed", trust: "trusted", handles: [handle] }, { id: "b", kind: "person", status: "active", trust: "trusted", handles: [handle] }] }));
-  assert.deepEqual(gone.model.trust.get(`handle:${handle}`), { trust: "unreviewed", gone: false }, "a departed 'trusted' is unreviewed and the stricter wins; the key is not gone while an active contact has it");
   void NPUB;
 });

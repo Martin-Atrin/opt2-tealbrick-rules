@@ -60,8 +60,14 @@ export interface CallFacts {
   callerTeams: readonly string[];
   /** team ids of the CALLER agent, every membership (deny and hold rules) */
   callerTeamsAny: readonly string[];
-  /** trust of the claimed requester (Fleet read model: contact id, canonical handle or agent id); null = no claim or facts unavailable. A requester the directory does not know is `unreviewed`. */
-  claimTrust: Trust | null;
+  /**
+   * The raw trust values of everyone who holds the claimed requester's key (contact id, canonical handle or agent id), as a
+   * set. `[]` = no claim or facts unavailable. A requester the directory does not know is `["unreviewed"]`.
+   * Deny/hold rules match when ANY holder's trust is listed; allow rules need EVERY holder active and listed.
+   */
+  claimTrusts: readonly Trust[];
+  /** false when any holder of the key is blocked, departed or removed (a gone holder never satisfies an allow rule by trust) */
+  claimTrustActive: boolean;
   /** false = the Fleet read model cannot be relied on (never read, refused, too old): see the header */
   fleetAvailable: boolean;
 }
@@ -80,8 +86,8 @@ export interface Verdict {
   viaClaim: boolean;
   /** true when the decisive deny/hold rule applied only because the Fleet facts it names were unavailable */
   closedOnFleet: boolean;
-  /** first allow rule skipped for unavailable Fleet facts whose narrowing is part of `narrowing` (names the rule when no rule decided) */
-  skippedRuleId: string | null;
+  /** the rule `narrowing` comes from: the deciding allow rule when it has one, else the first skipped allow rule that contributed */
+  narrowingRuleId: string | null;
 }
 
 export interface Step {
@@ -148,7 +154,11 @@ export function judge(spec: RuleSpec, facts: CallFacts, useClaim = true): { why:
       if (why) return no(why);
     }
     if (obo.trust?.length) {
-      const why = fleet(obo.trust.includes(facts.claimTrust ?? "unreviewed"), "claimed requester's trust is not listed");
+      const list = obo.trust;
+      const trusts = facts.claimTrusts;
+      // deny/hold: ANY holder of the key has a listed trust; allow: EVERY holder is active and has a listed trust
+      const met = strict ? trusts.some((t) => list.includes(t)) : facts.claimTrustActive && trusts.length > 0 && trusts.every((t) => list.includes(t));
+      const why = fleet(met, "claimed requester's trust is not listed");
       if (why) return no(why);
     }
   }
@@ -173,9 +183,16 @@ interface Hit {
   skippedRuleId: string | null;
 }
 
+/**
+ * The deciding rule. With the facts: the first rule that matches. WITHOUT them (unavailable): the HIGHEST severity
+ * (deny > hold > allow) among the closed deny/hold rules that precede the first rule that matches without any Fleet
+ * fact, together with that rule; ties go to the earlier rule. A later deny therefore always beats an earlier closed hold,
+ * so the result is never less strict than with the facts.
+ */
 function firstMatch(ordered: readonly Rule[], facts: CallFacts, useClaim: boolean): Hit {
   let skippedNarrowing: Narrowing | null = null;
   let skippedRuleId: string | null = null;
+  let worst: Rule | null = null;
   for (const r of ordered) {
     const j = judge(r.spec, facts, useClaim);
     if (j.skipped) {
@@ -185,14 +202,20 @@ function firstMatch(ordered: readonly Rule[], facts: CallFacts, useClaim: boolea
         skippedRuleId ??= r.id;
       }
     }
-    if (j.why === "") return { rule: r, closed: j.closed, skippedNarrowing, skippedRuleId };
+    if (j.why !== "") continue;
+    if (j.closed) {
+      if (!worst || SEVERITY[r.spec.outcome.decision] > SEVERITY[worst.spec.outcome.decision]) worst = r;
+      continue;
+    }
+    const decisive = worst && SEVERITY[worst.spec.outcome.decision] >= SEVERITY[r.spec.outcome.decision] ? worst : r;
+    return { rule: decisive, closed: decisive === worst, skippedNarrowing, skippedRuleId };
   }
-  return { rule: null, closed: false, skippedNarrowing, skippedRuleId };
+  return { rule: worst, closed: worst !== null, skippedNarrowing, skippedRuleId };
 }
 
 function verdictOf(hit: Hit): Verdict {
   const rule = hit.rule;
-  if (!rule) return { decision: "allow", reason: NO_MATCH_REASON, rule: null, narrowing: hit.skippedNarrowing, viaClaim: false, closedOnFleet: hit.skippedNarrowing !== null, skippedRuleId: hit.skippedRuleId };
+  if (!rule) return { decision: "allow", reason: NO_MATCH_REASON, rule: null, narrowing: hit.skippedNarrowing, viaClaim: false, closedOnFleet: hit.skippedNarrowing !== null, narrowingRuleId: hit.skippedRuleId };
   const own = rule.spec.outcome.decision === "allow" ? normNarrowing(rule.spec.narrowing) : null;
   const allow = rule.spec.outcome.decision === "allow";
   return {
@@ -202,7 +225,7 @@ function verdictOf(hit: Hit): Verdict {
     narrowing: allow ? mergeNarrowing(own, hit.skippedNarrowing) : null,
     viaClaim: dependsOnClaim(rule.spec),
     closedOnFleet: hit.closed || (allow && hit.skippedNarrowing !== null),
-    skippedRuleId: allow ? hit.skippedRuleId : null,
+    narrowingRuleId: allow ? (own ? rule.id : hit.skippedRuleId) : null,
   };
 }
 
@@ -237,7 +260,7 @@ export function evaluate(ordered: readonly Rule[], facts: CallFacts): Verdict {
   const base = verdictOf(firstMatch(ordered, facts, false));
   const strict = SEVERITY[withClaim.decision] >= SEVERITY[base.decision] ? withClaim : base;
   if (strict.decision !== "allow") return strict;
-  return { ...strict, narrowing: mergeNarrowing(withClaim.narrowing, base.narrowing), skippedRuleId: withClaim.skippedRuleId ?? base.skippedRuleId, closedOnFleet: withClaim.closedOnFleet || base.closedOnFleet };
+  return { ...strict, narrowing: mergeNarrowing(withClaim.narrowing, base.narrowing), narrowingRuleId: strict.narrowingRuleId ?? (strict === withClaim ? base : withClaim).narrowingRuleId, closedOnFleet: withClaim.closedOnFleet || base.closedOnFleet };
 }
 
 /** Per-rule explanation for the dry run. */

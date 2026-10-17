@@ -16,7 +16,7 @@ const CLAIM = { "tb.onBehalfOf": { claim: { kind: "channel_sender", id: "slack:u
 
 function j3Db() {
   const { db, raw } = migratedDb();
-  writeFleet(db, { teams: [{ id: "tm_x", name: "Team X", people: 1, agents: 0, keys: ["contact:psn_1", "handle:slack:U777"], activeKeys: ["contact:psn_1", "handle:slack:U777"] }], trust: new Map([["handle:slack:U777", { trust: "trusted" as const, gone: false }]]) }, { revision: 3, error: null });
+  writeFleet(db, { teams: [{ id: "tm_x", name: "Team X", people: 1, agents: 0, keys: ["contact:psn_1", "handle:slack:U777"], activeKeys: ["contact:psn_1", "handle:slack:U777"] }], trust: new Map([["handle:slack:U777", { trusts: ["trusted" as const], allActive: true }]]) }, { revision: 3, error: null });
   saveRule(db, { spec: spec({ title: "Team X: nothing with money", priority: 10, match: { effects: ["money"], onBehalfOf: { teams: ["tm_x"] } }, decision: "deny", reason: "Requests from team X may not involve money" }), actor: OWNER });
   saveRule(db, {
     spec: spec({ title: "Team X: work only", priority: 20, match: { onBehalfOf: { teams: ["tm_x"] } }, decision: "allow", reason: "Team X sees only work memories", narrowing: { memoryTags: { anyOf: ["work"], noneOf: ["critical"] } } }),
@@ -41,7 +41,7 @@ test("gate: deny with reason and a trace keyed by callId; ungated read without a
   ]);
   const money = traces.find((t) => t.callId === "cal_money");
   assert.equal(money?.ruleTitle, "Team X: nothing with money");
-  assert.deepEqual(money?.onBehalfOf, { kind: "channel_sender", id: "slack:u777", verified: false, teams: ["tm_x"], trust: "trusted" });
+  assert.deepEqual(money?.onBehalfOf, { kind: "channel_sender", id: "slack:u777", verified: false, teams: ["tm_x"], trust: ["trusted"] });
 });
 
 test("gate fails closed: over budget, aborted signal, store failure", async () => {

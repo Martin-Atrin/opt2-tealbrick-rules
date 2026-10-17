@@ -10,11 +10,11 @@ import { validateAgainstSchema } from "@opt2-tealbrick/manifest";
 import type { Json, OpContext } from "@opt2-tealbrick/miniapp-sdk";
 import { OP } from "#kit";
 import { handlers, manifest, migrationsDir } from "../src/app.ts";
-import { type CallFacts, evaluate, explain, order, type Rule, specProblem } from "../src/engine.ts";
+import { type CallFacts, evaluate, explain, order, type Rule, specProblem, type Trust } from "../src/engine.ts";
 import { syncFleet } from "../src/fleet.ts";
 import { makeHooks } from "../src/hooks.ts";
 import { fleetFacts, getDraft, listDecisions, recordDecision, saveRule } from "../src/store.ts";
-import { AGENT_A, AGENT_B, feed, hookCtx, hookReq, migratedDb, OWNER, opCtx, spec } from "./helpers.ts";
+import { AGENT_A, AGENT_B, feed, hookCtx, hookReq, migratedDb, OWNER, opCtx, spec, trustFacts } from "./helpers.ts";
 
 type Run = (input: unknown, ctx: OpContext) => Promise<any>;
 const run = (id: keyof typeof handlers) => (handlers[id] as unknown as { run: Run }).run;
@@ -23,16 +23,16 @@ const sha256 = (s: string) => createHash("sha256").update(s).digest("hex");
 const out = (v: ReturnType<typeof evaluate>) => ({ decision: v.decision, rule: v.rule?.id ?? null, narrowing: v.narrowing });
 const NOTHING = { decision: "allow", rule: null, narrowing: null } as const;
 const rule = (id: string, s: Rule["spec"]): Rule => ({ id, rev: 1, spec: s, updatedAt: 1 });
-const facts = (o: Partial<CallFacts> = {}): CallFacts => ({
+const facts = (o: Partial<CallFacts> & { claimTrust?: Trust | null } = {}): CallFacts => ({
   caller: { type: "agent", id: AGENT_A, mode: "free" },
   target: { product: "connect", op: "buzz_dm", effect: "outward" },
   claim: null,
   claimVerified: false,
   claimTeams: [],
   callerTeams: [],
-  claimTrust: null,
   fleetAvailable: true,
   ...o,
+  ...trustFacts(o),
   claimTeamsAny: o.claimTeamsAny ?? o.claimTeams ?? [],
   callerTeamsAny: o.callerTeamsAny ?? o.callerTeams ?? [],
 });
@@ -250,7 +250,7 @@ test("released migrations 0001 and 0002 are byte-for-byte what 0.2.12 shipped", 
     "0001_init.sql": "6386d3c572cd7a8c678a8b3d4ad18fdf228cc73a865456ab0ac236399b177a32",
     "0002_catalog.sql": "77879e04075f37575b37a285a4f4dfe7243a62756bd946c7a588846058184c79",
   });
-  assert.deepEqual(readdirSync(migrationsDir).filter((f) => f.endsWith(".sql")).sort(), ["0001_init.sql", "0002_catalog.sql", "0003_feed.sql", "0004_feed_sets.sql"]);
+  assert.deepEqual(readdirSync(migrationsDir).filter((f) => f.endsWith(".sql")).sort(), ["0001_init.sql", "0002_catalog.sql", "0003_feed.sql", "0004_feed_sets.sql", "0005_feed_holders.sql"]);
 });
 
 test("upgrade from a 0.2.12 database: rules, drafts and decisions stay; the old Fleet copy is cleared and unusable; old drafts get a derived source", () => {
@@ -267,8 +267,7 @@ test("upgrade from a 0.2.12 database: rules, drafts and decisions stay; the old 
     UPDATE fleet_sync SET revision = 9, synced_at = ${Date.now()}, stale = 0 WHERE id = 1;
   `);
   assert.equal(Number(raw.prepare("SELECT stale FROM fleet_sync").get()?.stale), 0, "0.2.12: a fresh, usable copy");
-  raw.exec(readFileSync(join(migrationsDir, "0003_feed.sql"), "utf8"));
-  raw.exec(readFileSync(join(migrationsDir, "0004_feed_sets.sql"), "utf8"));
+  for (const f of files.filter((x) => x >= "0003")) raw.exec(readFileSync(join(migrationsDir, f), "utf8"));
   const q = (sql: string) => raw.prepare(sql).all() as Record<string, unknown>[];
   assert.equal(q("SELECT id FROM rules")[0]?.id, "rul_old", "rules stay");
   assert.equal(q("SELECT id FROM drafts").length, 2, "drafts stay");
@@ -276,7 +275,7 @@ test("upgrade from a 0.2.12 database: rules, drafts and decisions stay; the old 
   const sync = q("SELECT revision, synced_at, stale, usable FROM fleet_sync")[0];
   assert.deepEqual({ ...sync }, { revision: null, synced_at: null, stale: 1, usable: 0 }, "the next read is a full one and the facts are unavailable until it succeeds");
   assert.deepEqual(q("SELECT * FROM fleet_trust"), []);
-  assert.throws(() => raw.exec("INSERT INTO fleet_trust (member_key, trust) VALUES ('contact:x', 'vip')"), /CHECK/);
+  assert.throws(() => raw.exec("INSERT INTO fleet_trust (member_key, trusts, all_active) VALUES ('contact:x', '', 1)"), /CHECK/);
   assert.equal(q("SELECT source FROM drafts WHERE id = 'drf_app'")[0]?.source, null);
   // through the store: a derived source, and the old hold rule is fail-closed until the first feed read
   const db = {

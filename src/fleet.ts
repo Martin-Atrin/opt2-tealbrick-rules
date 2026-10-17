@@ -13,7 +13,7 @@ import { normalizeHandle, validateAgainstSchema } from "@opt2-tealbrick/manifest
 import type { Db, Json } from "@opt2-tealbrick/miniapp-sdk";
 import feedSchema from "./contracts/fleet.directory_feed.1.schema.json" with { type: "json" };
 import type { Trust } from "./engine.ts";
-import { emptyFleet, FLEET_MAX_STALE_MS, type FleetModel, type FleetTeam, fleetState, setFleetStale, staleMarksOf, type TrustEntry, writeFleetChunked } from "./store.ts";
+import { dropFleetCopy, emptyFleet, FLEET_MAX_STALE_MS, type FleetModel, type FleetTeam, fleetState, setFleetStale, staleMarksOf, type TrustEntry, writeFleetChunked } from "./store.ts";
 
 export const FLEET_PRODUCT = "fleet";
 export const FLEET_OP = "directory_feed";
@@ -58,7 +58,7 @@ const isObj = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 
 
 const feedInvalid = (why: string): Error => Object.assign(new Error(why.slice(0, 240)), { code: FEED_INVALID });
 
-/** Least permissive last: the stricter trust wins whenever two values meet for one key (never widens). */
+/** Least permissive last: the stricter of two trust values (a monotone order: blocked > limited > unreviewed > trusted). */
 const STRICTNESS: readonly Trust[] = ["trusted", "unreviewed", "limited", "blocked"];
 export const strictest = (a: Trust, b: Trust): Trust => (STRICTNESS.indexOf(a) >= STRICTNESS.indexOf(b) ? a : b);
 
@@ -68,78 +68,170 @@ export interface ParsedFeed {
   model: FleetModel;
 }
 
-/**
- * The model from a `directory_feed` answer. Throws (code `feed_invalid`) unless the answer passes the vendored schema, every
- * handle is canonical and no team, contact or agent id is listed twice. Mapping:
- * - TWO key sets per team. `keys` = every member (deny and hold rules); `activeKeys` = members that count (allow rules).
- *   A DEPARTED or BLOCKED contact and a REMOVED agent are members but do not count; so is a member the producer left out
- *   of `contacts`/`agents`. A paused agent counts. Keys are dropped PER MEMBER: an active contact that shares a handle with
- *   a departed one keeps the handle key.
- *   Keys: `agent:<id>`; `contact:<id>` and `handle:<canonical>` (every handle of the contact).
- * - trust keys: `contact:<id>`, each `handle:<h>`, `agent:<id>`. A gone (departed/removed) `trusted` entry becomes
- *   `unreviewed`; blocked/limited/unreviewed stay. When several entries share a key the STRICTER trust wins, and the key is
- *   "gone" only if all of them are.
- */
-export function parseFeed(out: unknown): ParsedFeed {
-  if (!isObj(out)) throw feedInvalid("directory_feed answered no object");
-  const v = validateAgainstSchema(feedSchema as unknown as Parameters<typeof validateAgainstSchema>[0], out as Json);
-  if (!v.ok) throw feedInvalid(`the answer does not fit fleet.directory_feed/1: ${v.errors.slice(0, 3).map((e) => `${e.path || "/"} ${e.message}`).join("; ")}`);
-  const revision = out.revision as number;
-  if (out.unchanged === true) return { revision, unchanged: true, model: emptyFleet() };
+/** Work units between two yields to the event loop while an answer is read (about 2 to 5 ms of work). */
+export const PARSE_YIELD_UNITS = 4_000;
+type FullSchema = { $defs: { full: { properties: Record<"teams" | "contacts" | "agents", { maxItems: number }> } } };
+const CAPS = (feedSchema as unknown as FullSchema).$defs.full.properties;
 
-  const contacts = out.contacts as { id: string; kind: string; status: string; trust: Trust; handles: string[] }[];
-  const agents = out.agents as { id: string; status: string; trust: Trust }[];
-  const teamsIn = out.teams as { id: string; name?: string; members: { kind: string; id: string }[] }[];
-  for (const c of contacts)
-    for (const h of c.handles) if (normalizeHandle(h) !== h) throw feedInvalid(`a handle is not canonical (normalizeHandle): ${h.slice(0, 40)}`);
+/**
+ * The model from a `directory_feed` answer, as steps (a generator yields every PARSE_YIELD_UNITS units of work so a big
+ * answer never blocks the event loop; `parseFeed` runs it to the end). Throws (code `feed_invalid`) unless the answer
+ * passes the vendored schema (validated in slices, the array caps read from the schema), every handle is canonical and no
+ * team, contact or agent id is listed twice. Mapping, per KEY (`agent:<id>`, `contact:<id>`, `handle:<canonical>`; a handle
+ * can have several HOLDERS):
+ * - a holder is ACTIVE when it is not blocked, departed (contact) or removed (agent); a paused agent is active;
+ * - deny/hold rules: a key is in team T if ANY holder is a member of T (so blocked, departed and removed members count);
+ *   allow rules: only if EVERY holder is active and a member of T;
+ * - trust: the SET of the holders' raw trust values, and whether every holder is active. Deny/hold match if ANY holder's
+ *   trust is listed; allow needs every holder active and listed (a gone holder never satisfies an allow by trust);
+ * - a member the producer left out of `contacts`/`agents` has a team key for deny/hold only and no trust (unknown =
+ *   `unreviewed` at lookup).
+ */
+function* parseSteps(out: unknown): Generator<void, ParsedFeed, void> {
+  if (!isObj(out)) throw feedInvalid("directory_feed answered no object");
+  const schema = feedSchema as unknown as Parameters<typeof validateAgainstSchema>[0];
+  const check = (doc: Json) => {
+    const v = validateAgainstSchema(schema, doc);
+    if (!v.ok) throw feedInvalid(`the answer does not fit fleet.directory_feed/1: ${v.errors.slice(0, 3).map((e) => `${e.path || "/"} ${e.message}`).join("; ")}`);
+  };
+  if (out.unchanged === true) {
+    check(out as Json);
+    return { revision: out.revision as number, unchanged: true, model: emptyFleet() };
+  }
+  // Validate in slices (the same schema, each slice a full document with the other arrays empty), then the array caps.
+  const teamsIn = Array.isArray(out.teams) ? (out.teams as { id: string; name?: string; members: { kind: string; id: string }[] }[]) : null;
+  const contacts = Array.isArray(out.contacts) ? (out.contacts as { id: string; kind: string; status: string; trust: Trust; handles: string[] }[]) : null;
+  const agents = Array.isArray(out.agents) ? (out.agents as { id: string; status: string; trust: Trust }[]) : null;
+  // the document without its three big arrays (a missing or non-array member stays as it is, so the schema refuses it)
+  const shell = { ...out, ...Object.fromEntries((["teams", "contacts", "agents"] as const).filter((k) => Array.isArray(out[k])).map((k) => [k, []])) } as Json;
+  check(shell);
+  if (!teamsIn || !contacts || !agents) throw feedInvalid("teams, contacts and agents must be arrays");
+  for (const [name, list] of [["teams", teamsIn], ["contacts", contacts], ["agents", agents]] as const) {
+    if (list.length > CAPS[name].maxItems) throw feedInvalid(`more than ${CAPS[name].maxItems} ${name}`);
+  }
+  const slices: [keyof typeof CAPS, unknown[]][] = [];
+  for (let i = 0, n = 0, from = 0; i < teamsIn.length; i++) {
+    n += (Array.isArray(teamsIn[i]?.members) ? (teamsIn[i] as { members: unknown[] }).members.length : 0) + 1;
+    if (n >= PARSE_YIELD_UNITS || i === teamsIn.length - 1) {
+      slices.push(["teams", teamsIn.slice(from, i + 1)]);
+      from = i + 1;
+      n = 0;
+    }
+  }
+  for (let i = 0; i < contacts.length; i += 1000) slices.push(["contacts", contacts.slice(i, i + 1000)]);
+  for (let i = 0; i < agents.length; i += 4000) slices.push(["agents", agents.slice(i, i + 4000)]);
+  for (const [name, part] of slices) {
+    check({ ...(shell as Record<string, Json>), [name]: part } as Json);
+    yield;
+  }
+
+  let work = 0;
+  const tick = (n = 1): boolean => {
+    work += n;
+    if (work < PARSE_YIELD_UNITS) return false;
+    work = 0;
+    return true;
+  };
+  for (const c of contacts) {
+    for (const h of c.handles) {
+      if (normalizeHandle(h) !== h) throw feedInvalid(`a handle is not canonical (normalizeHandle): ${h.slice(0, 40)}`);
+      if (tick(40)) yield;
+    }
+  }
   for (const [what, ids] of [["team", teamsIn.map((t) => t.id)], ["contact", contacts.map((c) => c.id)], ["agent", agents.map((a) => a.id)]] as const) {
     const seen = new Set<string>();
     for (const id of ids) {
       if (seen.has(id)) throw feedInvalid(`${what} id listed twice: ${id.slice(0, 40)}`);
       seen.add(id);
     }
+    yield;
   }
 
-  const trust = new Map<string, TrustEntry>();
-  const put = (key: string, t: Trust, gone: boolean) => {
-    const cur = trust.get(key);
-    trust.set(key, cur ? { trust: strictest(cur.trust, t), gone: cur.gone && gone } : { trust: t, gone });
-  };
-  const contactBy = new Map<string, { keys: string[]; gone: boolean }>();
-  for (const c of contacts) {
-    const keys = [`contact:${c.id}`, ...c.handles.map((h) => `handle:${h}`)];
-    const gone = c.status === "departed" || c.trust === "blocked";
-    contactBy.set(c.id, { keys, gone });
-    const eff: Trust = gone && c.trust === "trusted" ? "unreviewed" : c.trust;
-    for (const k of keys) put(k, eff, gone);
-  }
-  const agentGone = new Map<string, boolean>();
-  for (const a of agents) {
-    const gone = a.status === "removed";
-    agentGone.set(a.id, gone);
-    put(`agent:${a.id}`, gone && a.trust === "trusted" ? "unreviewed" : a.trust, gone);
-  }
-
-  const teams: FleetTeam[] = [];
-  for (const t of teamsIn) {
-    const team: FleetTeam = { id: t.id, name: t.name ?? t.id, people: 0, agents: 0, keys: [], activeKeys: [] };
+  // teams of each contact / agent (every membership, regardless of status)
+  const contactTeams = new Map<string, Set<string>>();
+  const agentTeams = new Map<string, Set<string>>();
+  const out2 = teamsIn.map((t): FleetTeam => ({ id: t.id, name: t.name ?? t.id, people: 0, agents: 0, keys: [], activeKeys: [] }));
+  for (const [i, t] of teamsIn.entries()) {
+    const team = out2[i] as FleetTeam;
     for (const m of t.members) {
-      if (m.kind === "agent") {
-        team.agents++;
-        team.keys.push(`agent:${m.id}`);
-        if (agentGone.get(m.id) === false) team.activeKeys.push(`agent:${m.id}`);
-      } else {
-        team.people++;
-        const c = contactBy.get(m.id);
-        team.keys.push(...(c?.keys ?? [`contact:${m.id}`]));
-        if (c && !c.gone) team.activeKeys.push(...c.keys);
-      }
+      const map = m.kind === "agent" ? agentTeams : contactTeams;
+      if (m.kind === "agent") team.agents++;
+      else team.people++;
+      const set = map.get(m.id);
+      if (set) set.add(t.id);
+      else map.set(m.id, new Set([t.id]));
+      if (tick() ) yield;
     }
-    team.keys = [...new Set(team.keys)];
-    team.activeKeys = [...new Set(team.activeKeys)];
-    teams.push(team);
   }
-  return { revision, unchanged: false, model: { teams, trust } };
+
+  interface Holder {
+    trust: Trust;
+    active: boolean;
+    teams: ReadonlySet<string>;
+  }
+  const none: ReadonlySet<string> = new Set();
+  const holders = new Map<string, Holder[]>();
+  const hold = (key: string, h: Holder) => {
+    const list = holders.get(key);
+    if (list) list.push(h);
+    else holders.set(key, [h]);
+  };
+  const known = { contact: new Set<string>(), agent: new Set<string>() };
+  for (const c of contacts) {
+    known.contact.add(c.id);
+    const h: Holder = { trust: c.trust, active: c.status === "active" && c.trust !== "blocked", teams: contactTeams.get(c.id) ?? none };
+    hold(`contact:${c.id}`, h);
+    for (const handle of c.handles) hold(`handle:${handle}`, h);
+    if (tick(1 + c.handles.length)) yield;
+  }
+  for (const a of agents) {
+    known.agent.add(a.id);
+    hold(`agent:${a.id}`, { trust: a.trust, active: a.status !== "removed" && a.trust !== "blocked", teams: agentTeams.get(a.id) ?? none });
+    if (tick()) yield;
+  }
+
+  const byId = new Map(out2.map((t) => [t.id, t]));
+  const trust = new Map<string, TrustEntry>();
+  const place = (key: string, any: ReadonlySet<string>, act: ReadonlySet<string>) => {
+    for (const tid of any) {
+      const team = byId.get(tid) as FleetTeam;
+      team.keys.push(key);
+      if (act.has(tid)) team.activeKeys.push(key);
+    }
+  };
+  for (const [key, hs] of holders) {
+    const allActive = hs.every((h) => h.active);
+    const any = new Set<string>();
+    for (const h of hs) for (const t of h.teams) any.add(t);
+    // allow: the team must hold EVERY holder, and every holder must be active
+    let act: ReadonlySet<string> = none;
+    if (allActive) {
+      const first = hs[0] as Holder;
+      act = new Set([...first.teams].filter((t) => hs.every((h) => h.teams.has(t))));
+    }
+    trust.set(key, { trusts: [...new Set(hs.map((h) => h.trust))], allActive });
+    place(key, any, act);
+    if (tick(1 + any.size)) yield;
+  }
+  // members the producer left out of contacts/agents: deny/hold only
+  for (const [id, ts] of contactTeams) if (!known.contact.has(id)) place(`contact:${id}`, ts, none);
+  for (const [id, ts] of agentTeams) if (!known.agent.has(id)) place(`agent:${id}`, ts, none);
+  return { revision: out.revision as number, unchanged: false, model: { teams: out2, trust } };
+}
+
+/** Read an answer in one go (small answers, tests). */
+export function parseFeed(out: unknown): ParsedFeed {
+  const g = parseSteps(out);
+  for (let r = g.next(); ; r = g.next()) if (r.done) return r.value;
+}
+
+/** Read an answer, yielding to the event loop between slices of work. */
+export async function parseFeedChunked(out: unknown, pause: () => Promise<void> = () => new Promise((r) => setImmediate(r))): Promise<ParsedFeed> {
+  const g = parseSteps(out);
+  for (let r = g.next(); ; r = g.next()) {
+    if (r.done) return r.value;
+    await pause();
+  }
 }
 
 const inflight = new WeakMap<Db, Promise<void>>();
@@ -153,11 +245,16 @@ export function syncFleet(db: Db, callApp: CallApp, now: () => number = Date.now
   const running = inflight.get(db);
   if (running) return running;
   const p = (async () => {
-    for (let round = 0; round < 3; round++) {
-      const marks = staleMarksOf(db);
-      await syncOnce(db, callApp, now);
-      if (staleMarksOf(db) === marks) break;
-      setFleetStale(db);
+    try {
+      for (let round = 0; round < 3; round++) {
+        const marks = staleMarksOf(db);
+        await syncOnce(db, callApp, now);
+        if (staleMarksOf(db) === marks) break;
+        setFleetStale(db);
+      }
+    } catch (e) {
+      // syncOnce handles its own failures; this is the net under it: a sync never rejects, and the copy is dropped
+      dropFleetCopy(db, `Governance sync failed: ${e instanceof Error ? e.message : "unknown"}`);
     }
   })().finally(() => inflight.delete(db));
   inflight.set(db, p);
@@ -170,7 +267,7 @@ async function syncOnce(db: Db, callApp: CallApp, now: () => number): Promise<vo
     const since = st.revision != null && !st.stale && st.usable ? st.revision : null;
     const res = await callApp(FLEET_PRODUCT, FLEET_OP, since !== null ? { sinceRevision: since } : {});
     if (res.status !== "ok") throw Object.assign(new Error("Governance held the directory read"), { code: "held" });
-    const d = parseFeed(res.output);
+    const d = await parseFeedChunked(res.output);
     // "unchanged" is only valid for the revision we asked about; anything else is a broken answer, not a no-op.
     if (d.unchanged && d.revision !== since) throw feedInvalid(`unchanged answered for revision ${d.revision}, asked ${since ?? "none"}`);
     await writeFleetChunked(db, d.unchanged ? null : d.model, { revision: d.revision, error: null }, now());
@@ -182,7 +279,12 @@ async function syncOnce(db: Db, callApp: CallApp, now: () => number): Promise<vo
     const expired = st.syncedAt == null || t - st.syncedAt > FLEET_MAX_STALE_MS;
     // Refusal → clear now; transient → keep the last copy for ≤ 10 min after the last successful read, then clear.
     // The timer keeps retrying every REFRESH_MS either way.
-    await writeFleetChunked(db, isRefusal(e) || expired ? emptyFleet() : null, { revision: st.revision, error: msg }, t);
+    try {
+      await writeFleetChunked(db, isRefusal(e) || expired ? emptyFleet() : null, { revision: st.revision, error: msg }, t);
+    } catch (writeError) {
+      // The database refuses the write that records the error / clears the copy: fail closed in memory.
+      dropFleetCopy(db, `${msg} (and the copy could not be cleared: ${writeError instanceof Error ? writeError.message : "database error"})`);
+    }
   }
 }
 

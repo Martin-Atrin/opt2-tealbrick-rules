@@ -3,12 +3,12 @@
 import assert from "node:assert/strict";
 import { performance } from "node:perf_hooks";
 import { test } from "node:test";
-import { type CallFacts, evaluate, explain, handleOf, mergeNarrowing, NO_MATCH_REASON, order, type Rule, redactionsFor, specProblem } from "../src/engine.ts";
+import { type CallFacts, evaluate, explain, handleOf, mergeNarrowing, NO_MATCH_REASON, order, type Rule, redactionsFor, specProblem, type Trust } from "../src/engine.ts";
 import { gateAnswer } from "../src/hooks.ts";
-import { AGENT_A, AGENT_B, NPUB, spec } from "./helpers.ts";
+import { AGENT_A, AGENT_B, NPUB, spec, trustFacts } from "./helpers.ts";
 
 const rule = (id: string, s: Rule["spec"], updatedAt = 1): Rule => ({ id, rev: 1, spec: s, updatedAt });
-const facts = (o: Partial<Omit<CallFacts, "caller" | "target">> & { effect?: string; product?: string; op?: string; mode?: string | null; caller?: string } = {}): CallFacts => ({
+const facts = (o: Partial<Omit<CallFacts, "caller" | "target">> & { claimTrust?: Trust | null; effect?: string; product?: string; op?: string; mode?: string | null; caller?: string } = {}): CallFacts => ({
   caller: { type: "agent", id: o.caller ?? AGENT_A, mode: o.mode === undefined ? "free" : o.mode },
   target: { product: o.product ?? "connect", op: o.op ?? "buzz_dm", effect: o.effect ?? "outward" },
   claim: o.claim ?? null,
@@ -17,7 +17,7 @@ const facts = (o: Partial<Omit<CallFacts, "caller" | "target">> & { effect?: str
   claimTeamsAny: o.claimTeamsAny ?? o.claimTeams ?? [],
   callerTeams: o.callerTeams ?? [],
   callerTeamsAny: o.callerTeamsAny ?? o.callerTeams ?? [],
-  claimTrust: o.claimTrust ?? null,
+  ...trustFacts(o),
   fleetAvailable: o.fleetAvailable ?? true,
 });
 

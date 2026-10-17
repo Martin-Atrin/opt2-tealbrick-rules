@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type { Db, HookContext, HookRequest, Json, OpContext } from "@opt2-tealbrick/miniapp-sdk";
 import { migrationsDir } from "../src/app.ts";
-import type { RuleSpec } from "../src/engine.ts";
+import type { RuleSpec, Trust } from "../src/engine.ts";
 
 // Booted apps in unit tests never read the real release index (catalog tests use a signed fake index).
 process.env.TB_RULES_CATALOG_OFF = "1";
@@ -92,6 +92,15 @@ export function feed(over: Record<string, unknown> = {}): Record<string, Json> {
     ],
     ...over,
   } as Record<string, Json>;
+}
+
+/**
+ * Trust facts for a hand-built CallFacts: `claimTrust` (a single holder: a value, or null = unknown requester → unreviewed),
+ * or `claimTrusts` + `claimTrustActive` for several holders. No claim and nothing given → no trust.
+ */
+export function trustFacts(o: { claim?: unknown; claimTrust?: Trust | null; claimTrusts?: readonly Trust[]; claimTrustActive?: boolean }): { claimTrusts: readonly Trust[]; claimTrustActive: boolean } {
+  const trusts = o.claimTrusts ?? (o.claimTrust !== undefined ? [o.claimTrust ?? "unreviewed"] : o.claim ? ["unreviewed" as const] : []);
+  return { claimTrusts: trusts, claimTrustActive: o.claimTrustActive ?? true };
 }
 
 export function spec(o: Partial<RuleSpec> & { decision?: RuleSpec["outcome"]["decision"]; reason?: string }): RuleSpec {
