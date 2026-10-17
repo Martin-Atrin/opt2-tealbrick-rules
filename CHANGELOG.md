@@ -18,7 +18,7 @@ Governance feed contract, G-3 (decisions C230, C166, C236). Not tagged: the rele
 
 ### Changed
 - The companion is `fleet.directory_feed` (read), not `directory_get`. Every answer is validated against the vendored schema (`validateAgainstSchema` of `@opt2-tealbrick/manifest`) and every handle must satisfy `normalizeHandle(h) === h`. A mismatch is a refusal: the error shows in `fleet_status`, the copy is cleared, nothing of the answer is read. An `unchanged` answer is believed only for the `sinceRevision` that was sent. The 503 `feed_too_large` is transient (the last copy stays up to 10 minutes).
-- Mapping: team keys `agent:<id>`, `contact:<id>` and `handle:<canonical>`. A departed contact and a removed agent carry no team; a paused agent keeps its teams. Trust keys are `contact:<id>` and every handle of the contact; a departed contact keeps its trust unless it is `trusted`; when two contacts share a handle the stricter trust wins.
+- Mapping: team keys `agent:<id>`, `contact:<id>` and `handle:<canonical>`. A departed contact, a blocked contact and a removed agent carry no team (a blocked requester never gains access from a team-scoped allow rule; same as Governance's `resolve_sender`); a paused agent keeps its teams. Trust keys are `contact:<id>` and every handle of the contact; a departed contact keeps its trust unless it is `trusted`; when two contacts share a handle the stricter trust wins.
 - Handles use the one shared `normalizeHandle` of `@opt2-tealbrick/manifest` 0.1.19 (G-4); a claim id that is not a valid handle has no handle (no match, never the raw text). The local normaliser is gone.
 - UI and manifest text say "Governance" where they said "Organization Plane".
 - Dependencies: manifest 0.1.19 (was 0.1.18); miniapp-sdk 0.1.25, conformance 0.1.18 and ui 0.2.4 unchanged. Lockfile integrity re-pinned.
@@ -29,4 +29,4 @@ Governance feed contract, G-3 (decisions C230, C166, C236). Not tagged: the rele
 - Operations note: an owner who has deny or hold rules on teams sees them apply to every matching call while Governance is down or older than 0.2.0. That is the intent.
 
 ### Not in this release
-- Agent trust (`agents[].trust`) is not a match criterion. A blocked contact keeps its teams (Governance's `resolve_sender` drops them; the feed does not).
+- Agent trust (`agents[].trust`) is not a match criterion.

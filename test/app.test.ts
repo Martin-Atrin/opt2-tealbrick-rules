@@ -152,7 +152,7 @@ const DIRECTORY = feed({ revision: 7 });
 
 test("Fleet read model: parse, departed contacts dropped, unchanged keeps, refusal empties, transient error keeps", async () => {
   const d = parseFeed(DIRECTORY);
-  assert.deepEqual(d.model.teams[0]?.keys.sort(), [`agent:${AGENT_A}`, "contact:ct_anna", "contact:ct_block", "handle:slack:U666", "handle:slack:U777", `handle:${NPUB}`].sort());
+  assert.deepEqual(d.model.teams[0]?.keys.sort(), [`agent:${AGENT_A}`, "contact:ct_anna", "handle:slack:U777", `handle:${NPUB}`].sort());
   const { db } = migratedDb();
   let answer: unknown = DIRECTORY;
   let fail: string | null = null;

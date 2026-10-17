@@ -73,7 +73,7 @@ export interface ParsedFeed {
  * every handle is canonical. Mapping:
  * - team keys: `agent:<id>` for an agent member; `contact:<id>` and `handle:<canonical>` (every handle of the contact) for
  *   a contact member;
- * - a DEPARTED contact and a REMOVED agent carry no team (never widens); a paused agent keeps its teams;
+ * - a DEPARTED or BLOCKED contact and a REMOVED agent carry no team (never widens; matches Governance's resolve_sender); a paused agent keeps its teams;
  * - trust keys: `contact:<id>` and each `handle:<h>` of a contact; a departed contact keeps its trust unless it is
  *   `trusted` (a departed person is no longer trusted; blocked/limited/unreviewed stay so deny and hold rules still see them);
  *   when two contacts share a handle the stricter trust wins.
@@ -97,7 +97,7 @@ export function parseFeed(out: unknown): ParsedFeed {
   for (const c of contacts) {
     const keys = [`contact:${c.id}`, ...c.handles.map((h) => `handle:${h}`)];
     contactKeys.set(c.id, keys);
-    if (c.status === "departed") for (const k of keys) gone.add(k);
+    if (c.status === "departed" || c.trust === "blocked") for (const k of keys) gone.add(k);
     if (c.status === "departed" && c.trust === "trusted") continue;
     for (const k of keys) setTrust(k, c.trust);
   }

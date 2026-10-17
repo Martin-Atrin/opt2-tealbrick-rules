@@ -251,6 +251,9 @@ test("feed mapping: agent/contact/handle keys; departed contacts and removed age
   assert.deepEqual(idx.get("handle:slack:U777"), ["tm_x"]);
   assert.equal(idx.get("contact:ct_gone"), undefined, "departed contact: no team");
   assert.equal(idx.get("handle:telegram:9"), undefined);
+  // BLOCKED contact: no team by id or by handle (fire), while an active one has it (quiet above); its trust stays "blocked"
+  assert.equal(idx.get("contact:ct_block"), undefined, "blocked contact: no team");
+  assert.equal(idx.get("handle:slack:U666"), undefined);
   assert.deepEqual(fleetTeams(db), [{ id: "tm_x", name: "Team X", people: 3, agents: 2 }, { id: "tm_y", name: "tm_y", people: 0, agents: 1 }]);
   const trust = fleetFacts(db, T0).trust;
   assert.equal(trust.get("contact:ct_anna"), "trusted");
@@ -268,4 +271,24 @@ test("feed mapping: agent/contact/handle keys; departed contacts and removed age
   await syncFleet(db, async () => ({ status: "ok" as const, output: dup }), () => T0 + 2);
   assert.equal(fleetFacts(db, T0 + 2).trust.get("handle:slack:U777"), "limited", "two contacts, one handle: the stricter trust wins");
   assert.equal(emptyFleet().teams.length, 0);
+});
+
+test("blocked contact carries no team: a team-scoped ALLOW rule does not widen for it (fire) and still applies to an active member (quiet); deny-by-trust still sees it", async () => {
+  const as = (id: string, kind = "channel_sender") => ({ "tb.onBehalfOf": { claim: { kind, id }, verified: true } }) as Record<string, Json>;
+  const gateAs = (db: ReturnType<typeof migratedDb>["db"], ctx: Record<string, Json>) => call("rules_gate", hookReq("before", { effect: "outward", context: ctx }), hookCtx(db));
+  const setup = async (withTrustRule: boolean) => {
+    const { db } = migratedDb();
+    saveRule(db, { spec: spec({ title: "Team X may send", priority: 1, match: { effects: ["outward"], onBehalfOf: { teams: ["tm_x"] } }, decision: "allow", reason: "team X" }), actor: OWNER });
+    saveRule(db, { spec: spec({ title: "no sends", priority: 5, match: { effects: ["outward"] }, decision: "deny", reason: "no sends" }), actor: OWNER });
+    if (withTrustRule) saveRule(db, { spec: spec({ title: "blocked", priority: 0, match: { onBehalfOf: { trust: ["blocked"] } }, decision: "deny", reason: "blocked requester" }), actor: OWNER });
+    await syncFleet(db, async () => ({ status: "ok" as const, output: feed() }));
+    return db;
+  };
+  const plain = await setup(false);
+  assert.deepEqual(await gateAs(plain, as("slack:u777")), { allow: true }, "quiet: an active member rides the team allow rule");
+  assert.match(String((await gateAs(plain, as("slack:u666"))).reason), /no sends/, "fire: blocked by handle has no team, so the allow rule does not apply");
+  assert.match(String((await gateAs(plain, as("ct_block", "person"))).reason), /no sends/, "fire: blocked by contact id, same");
+  const withTrust = await setup(true);
+  assert.match(String((await gateAs(withTrust, as("slack:u666"))).reason), /blocked requester/, "its trust stays 'blocked': a deny by trust still applies");
+  assert.deepEqual(await gateAs(withTrust, as("slack:u777")), { allow: true }, "quiet: the trust deny does not touch a trusted member");
 });
