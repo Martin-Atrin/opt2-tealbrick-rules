@@ -9,6 +9,8 @@ import {
   type DecisionsListOutput,
   type DraftDecideInput,
   type DraftDecideOutput,
+  type DraftStatusInput,
+  type DraftStatusOutput,
   type DraftsListInput,
   type DraftsListOutput,
   type FleetStatusInput,
@@ -31,14 +33,15 @@ import {
   type RulesSetOutput,
 } from "#kit";
 import { catalogOf, catalogState, ensureCatalog, opTitles, type SyncOptions, startCatalogTimer } from "./catalog.ts";
-import { type CallFacts, claimKey, evaluate, explain, order, type Rule, type RuleSpec } from "./engine.ts";
-import { type CallApp, refreshIfStale, startFleetTimer, syncFleet } from "./fleet.ts";
-import { gateAnswer, HOLD_SUPPORTED, makeHooks } from "./hooks.ts";
+import { type CallFacts, evaluate, explain, order, type Rule, type RuleSpec } from "./engine.ts";
+import { type CallApp, refreshIfStale, startFleetTimer, strictest, syncFleet } from "./fleet.ts";
+import { claimFleetFacts, gateAnswer, HOLD_SUPPORTED, makeHooks } from "./hooks.ts";
 import {
   type DraftView,
   decideDraft,
   deleteRule,
-  fleetIndex,
+  draftStatusFor,
+  fleetFacts,
   fleetState,
   fleetTeams,
   getDraft,
@@ -139,12 +142,16 @@ export const handlers = {
       }
       const rules: Rule[] = order([...liveRules(ctx.db), ...(input.candidate ? [{ id: "candidate", rev: 0, spec: input.candidate, updatedAt: Date.now() }] : [])]);
       const claim = input.call.onBehalfOf ?? null;
+      const fx = fleetFacts(ctx.db);
       const facts: CallFacts = {
         caller: { type: input.call.caller.type, id: input.call.caller.id, mode: input.call.caller.mode ?? null },
         target: { ...input.call.target },
         claim,
         claimVerified: false,
-        claimTeams: claim ? (fleetIndex(ctx.db).get(claimKey(claim)) ?? []) : [],
+        ...claimFleetFacts(fx, claim),
+        callerTeams: input.call.caller.type === "agent" ? (fx.teams.get(`agent:${input.call.caller.id}`) ?? []) : [],
+        callerTeamsAny: input.call.caller.type === "agent" ? (fx.teamsAny.get(`agent:${input.call.caller.id}`) ?? []) : [],
+        fleetAvailable: fx.available,
       };
       const v = evaluate(rules, facts);
       return {
@@ -154,7 +161,10 @@ export const handlers = {
         ruleId: v.rule?.id ?? null,
         ruleTitle: v.rule?.title ?? null,
         narrowing: v.narrowing,
-        teams: [...facts.claimTeams],
+        teams: [...new Set([...facts.claimTeams, ...facts.claimTeamsAny])],
+        callerTeams: [...new Set([...facts.callerTeams, ...facts.callerTeamsAny])],
+        trust: facts.claimTrusts.length ? facts.claimTrusts.reduce(strictest) : null,
+        fleetAvailable: facts.fleetAvailable,
         steps: explain(rules, facts),
       };
     },
@@ -190,6 +200,7 @@ export const handlers = {
       const teams = fleetTeams(ctx.db);
       return {
         source: st.revision != null || teams.length > 0 ? "fleet" : "none",
+        available: fleetFacts(ctx.db).available,
         revision: st.revision,
         syncedAt: st.syncedAt == null ? null : new Date(st.syncedAt).toISOString(),
         error: st.error,
@@ -212,8 +223,15 @@ export const handlers = {
           reason: d.reason,
           ruleId: d.ruleId,
           ruleTitle: d.ruleTitle,
+          fleetUnavailable: d.detail?.fleetUnavailable === true,
         })),
       };
+    },
+  }),
+  [OP.draftStatus]: op<DraftStatusInput, DraftStatusOutput>({
+    // Only for drafts THIS caller submitted (agent or companion app); anyone else's draft answers like a missing one.
+    async run(input, ctx) {
+      return draftStatusFor(ctx.db, { type: ctx.caller.type, id: ctx.caller.id }, input.draftId);
     },
   }),
   [OP.ruleDraftSubmit]: op<RuleDraftSubmitInput, RuleDraftSubmitOutput>({

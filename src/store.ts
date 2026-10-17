@@ -4,7 +4,7 @@
 import { ulid } from "@opt2-tealbrick/manifest";
 import { type Db, TbError } from "@opt2-tealbrick/miniapp-sdk";
 import { CATALOG_MISSING, catalogOf, catalogProblem } from "./catalog.ts";
-import { type CallFacts, type Decision, order, type Rule, type RuleSpec, specProblem } from "./engine.ts";
+import { type CallFacts, type Decision, order, type Rule, type RuleSpec, specProblem, type Trust } from "./engine.ts";
 
 /** At most this many live rules (a gate evaluates all of them on every call). */
 export const MAX_RULES = 500;
@@ -26,8 +26,22 @@ const json = <T>(s: unknown, fallback: T): T => {
 
 // ── caches ───────────────────────────────────────────────────────────────────
 const ruleCache = new WeakMap<Db, Rule[]>();
-const fleetCache = new WeakMap<Db, { idx: Map<string, string[]>; okAt: number | null }>();
-/** A Fleet copy older than this (no successful read since) is not used: team rules match nobody (A2A-9, fail safe). */
+interface FleetCacheEntry {
+  idx: Map<string, string[]>;
+  idxAny: Map<string, string[]>;
+  trust: Map<string, TrustEntry>;
+  gone: Set<string>;
+  okAt: number | null;
+  usable: boolean;
+}
+const fleetCache = new WeakMap<Db, FleetCacheEntry>();
+/** Count of markFleetStale calls per database: a sync that sees it move while it ran reads once more (dirty flag). */
+const staleMarks = new WeakMap<Db, number>();
+export const staleMarksOf = (db: Db): number => staleMarks.get(db) ?? 0;
+/**
+ * A Fleet copy older than this (no successful read since) is not used (A2A-9): the facts count as UNAVAILABLE, so deny and
+ * hold rules that name Fleet facts apply and allow rules that name them do not (C230, fail closed).
+ */
 export const FLEET_MAX_STALE_MS = 10 * 60 * 1000;
 
 export function invalidateRules(db: Db): void {
@@ -134,20 +148,42 @@ export interface DraftView {
   note: string;
   rules: RuleSpec[];
   submittedBy: { type: string; id: string; name: string };
+  /** who proposed it: an agent, or an app (G-3e: the Drafts page says "proposed by <app>") */
+  source: DraftSource;
   submittedAt: string;
   decidedAt: string | null;
   decidedBy: string | null;
   ruleIds: string[];
 }
 
+export interface DraftSource {
+  kind: "agent" | "app";
+  /** product id of the proposing app, only when verified (never today: the SDK has no Caller.product) */
+  product?: string;
+  name?: string;
+  instance?: string;
+}
+
+/**
+ * Who proposed a draft. An app caller is named by the SDK from the verified slice (`Caller.name` = the caller's manifest
+ * name, `Caller.id` = its instance id, SDK 0.1.25). The SDK gives no product id on the context, so `product` is NEVER set
+ * here: a product is recorded only when it is verified (SDK request pending). The Drafts page shows the name as unverified.
+ */
+export function sourceOf(by: { type: string; id: string; name: string }): DraftSource {
+  if (by.type !== "app") return { kind: "agent" };
+  return { kind: "app", name: by.name.slice(0, 80), instance: by.id };
+}
+
 function draftView(r: Record<string, unknown>): DraftView {
+  const by = { type: String(r.submitted_by_type), id: String(r.submitted_by_id), name: String(r.submitted_by_name) };
   return {
     id: String(r.id),
     status: String(r.status) as DraftView["status"],
     text: String(r.text),
     note: String(r.note),
     rules: json<RuleSpec[]>(r.rules, []),
-    submittedBy: { type: String(r.submitted_by_type), id: String(r.submitted_by_id), name: String(r.submitted_by_name) },
+    submittedBy: by,
+    source: json<DraftSource | null>(r.source, null) ?? sourceOf(by),
     submittedAt: iso(Number(r.submitted_at)) as string,
     decidedAt: iso(r.decided_at == null ? null : Number(r.decided_at)),
     decidedBy: r.decided_by == null ? null : String(r.decided_by),
@@ -163,14 +199,25 @@ export function submitDraft(db: Db, input: { text: string; note?: string; rules:
   if (pending >= MAX_PENDING_DRAFTS) throw new TbError("too_many_drafts", `at most ${MAX_PENDING_DRAFTS} pending drafts per agent; ask the owner to review them`, 429);
   const id = `drf_${ulid(now)}`;
   db.prepare(
-    "INSERT INTO drafts (id, status, text, note, rules, submitted_by_type, submitted_by_id, submitted_by_name, submitted_at) VALUES (?, 'pending', ?, ?, ?, ?, ?, ?, ?)",
-  ).run(id, input.text, input.note ?? "", JSON.stringify(input.rules), input.by.type, input.by.id, input.by.name.slice(0, 120), now);
+    "INSERT INTO drafts (id, status, text, note, rules, submitted_by_type, submitted_by_id, submitted_by_name, submitted_at, source) VALUES (?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?)",
+  ).run(id, input.text, input.note ?? "", JSON.stringify(input.rules), input.by.type, input.by.id, input.by.name.slice(0, 120), now, JSON.stringify(sourceOf(input.by)));
   return draftView(db.prepare("SELECT * FROM drafts WHERE id = ?").get(id) as Record<string, unknown>);
 }
 
 export function getDraft(db: Db, id: string): DraftView | null {
   const row = db.prepare("SELECT * FROM drafts WHERE id = ?").get(id);
   return row ? draftView(row) : null;
+}
+
+/**
+ * `draft_status`: the state of a draft, only for the caller that submitted it. A draft of someone else answers exactly
+ * like a missing one (404 not_found), so an id never tells a caller whether another caller's draft exists.
+ */
+export function draftStatusFor(db: Db, caller: { type: string; id: string }, draftId: string): { draftId: string; status: DraftView["status"]; submittedAt: string; decidedAt: string | null; ruleCount: number } {
+  const row = db.prepare("SELECT * FROM drafts WHERE id = ? AND submitted_by_type = ? AND submitted_by_id = ?").get(draftId, caller.type, caller.id);
+  if (!row) throw new TbError("not_found", "no draft with this id", 404);
+  const d = draftView(row);
+  return { draftId: d.id, status: d.status, submittedAt: d.submittedAt, decidedAt: d.decidedAt, ruleCount: d.ruleIds.length };
 }
 
 export function pendingDraftCount(db: Db): number {
@@ -229,7 +276,7 @@ let inserts = 0;
 
 export function recordDecision(db: Db, t: TraceInput, now = Date.now()): string {
   const id = `dec_${ulid(now)}`;
-  const obo = t.facts.claim ? JSON.stringify({ ...t.facts.claim, verified: t.facts.claimVerified, teams: t.facts.claimTeams }) : null;
+  const obo = t.facts.claim ? JSON.stringify({ ...t.facts.claim, verified: t.facts.claimVerified, teams: t.facts.claimTeams, trust: t.facts.claimTrusts }) : null;
   db.prepare(
     "INSERT INTO decisions (id, call_id, phase, at, caller_type, caller_id, caller_mode, product, op, effect, decision, answered, reason, rule_id, rule_rev, rule_title, on_behalf_of, detail, duration_us) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
   ).run(
@@ -324,8 +371,23 @@ export interface FleetTeam {
   name: string;
   people: number;
   agents: number;
-  /** member keys: person:<id>, agent:<id>, handle:<handle> */
+  /** member keys of EVERY member: agent:<id>, contact:<id>, handle:<canonical handle> (deny and hold rules) */
   keys: string[];
+  /** the keys of members that count (not blocked, departed, removed): a subset of `keys` (allow rules) */
+  activeKeys: string[];
+}
+
+/** Everyone who holds one key (a handle can be held by several contacts): the SET of their raw trust values, and whether all are active. */
+export interface TrustEntry {
+  trusts: Trust[];
+  /** false when any holder is blocked, departed or removed (a gone holder never satisfies an allow rule by trust) */
+  allActive: boolean;
+}
+
+/** One read of the feed, mapped: teams with member keys, and the trust of each contact key (contact:<id>, handle:<h>). */
+export interface FleetModel {
+  teams: FleetTeam[];
+  trust: Map<string, TrustEntry>;
 }
 
 export interface FleetSyncState {
@@ -334,39 +396,146 @@ export interface FleetSyncState {
   syncedAt: number | null;
   stale: boolean;
   error: string | null;
+  /** false after a refusal cleared the copy (and before the first read): the copy is unavailable whatever its age */
+  usable: boolean;
 }
+
+/** An error that could not be written to the database (it is broken); shown by fleet_status until the next good write. */
+const memoryError = new WeakMap<Db, string>();
 
 export function fleetState(db: Db): FleetSyncState {
-  const r = db.prepare("SELECT revision, synced_at, stale, error FROM fleet_sync WHERE id = 1").get();
-  return { revision: r?.revision == null ? null : Number(r.revision), syncedAt: r?.synced_at == null ? null : Number(r.synced_at), stale: Number(r?.stale ?? 1) === 1, error: r?.error == null ? null : String(r.error) };
-}
-
-export function markFleetStale(db: Db): void {
-  db.prepare("UPDATE fleet_sync SET stale = 1 WHERE id = 1").run();
+  const r = db.prepare("SELECT revision, synced_at, stale, error, usable FROM fleet_sync WHERE id = 1").get();
+  const mem = memoryError.get(db);
+  return {
+    revision: r?.revision == null ? null : Number(r.revision),
+    syncedAt: r?.synced_at == null ? null : Number(r.synced_at),
+    stale: mem !== undefined || Number(r?.stale ?? 1) === 1,
+    error: mem ?? (r?.error == null ? null : String(r.error)),
+    usable: mem === undefined && Number(r?.usable ?? 0) === 1,
+  };
 }
 
 /**
- * One sync outcome in one transaction. Success (`error` null): `teams` replaces the model (null = unchanged), the read
- * time moves. Failure: `teams` = [] clears the model (revision forgotten, next read is a full one), null keeps it; the
- * last successful read time stays.
+ * Last resort when the database refuses the write that clears the copy: drop the in-memory copy so the gate sees the Fleet
+ * facts as unavailable (fail closed) and keep the error in memory. Never throws.
  */
-export function writeFleet(db: Db, teams: FleetTeam[] | null, state: { revision: number | null; error: string | null }, now = Date.now()): void {
-  db.transaction(() => {
-    if (teams) {
-      db.exec("DELETE FROM fleet_members; DELETE FROM fleet_teams;");
-      const t = db.prepare("INSERT INTO fleet_teams (id, name, people, agents) VALUES (?, ?, ?, ?)");
-      const m = db.prepare("INSERT OR IGNORE INTO fleet_members (team_id, member_key) VALUES (?, ?)");
-      for (const team of teams) {
-        t.run(team.id, team.name, team.people, team.agents);
-        for (const k of team.keys) m.run(team.id, k);
-      }
-    }
-    if (state.error === null) db.prepare("UPDATE fleet_sync SET revision = ?, synced_at = ?, stale = 0, error = NULL WHERE id = 1").run(state.revision, now);
-    else if (teams) db.prepare("UPDATE fleet_sync SET revision = NULL, stale = 1, error = ? WHERE id = 1").run(state.error);
-    else db.prepare("UPDATE fleet_sync SET error = ? WHERE id = 1").run(state.error);
-  });
-  fleetCache.delete(db);
+export function dropFleetCopy(db: Db, error: string): void {
+  memoryError.set(db, error.slice(0, 280));
+  fleetCache.set(db, { idx: new Map(), idxAny: new Map(), trust: new Map(), gone: new Set(), okAt: null, usable: false });
 }
+
+/** Set the stale flag without counting it (a sync re-arming itself). */
+export function setFleetStale(db: Db): void {
+  db.prepare("UPDATE fleet_sync SET stale = 1 WHERE id = 1").run();
+}
+
+export function markFleetStale(db: Db): void {
+  staleMarks.set(db, staleMarksOf(db) + 1);
+  setFleetStale(db);
+}
+
+/**
+ * One sync outcome in one transaction. Success (`error` null): `model` replaces the copy (null = unchanged), the read
+ * time moves and the copy is usable. Failure: `model` = an EMPTY model clears the copy (revision forgotten, next read is a
+ * full one, copy unusable), null keeps it; the last successful read time stays.
+ */
+/** Rows per transaction while a big directory is written (about 10 ms each); the loop yields to the event loop between them. */
+export const FLEET_WRITE_CHUNK_ROWS = 4000;
+
+const add = (map: Map<string, string[]>, k: string, team: string) => {
+  const list = map.get(k);
+  if (list) list.push(team);
+  else map.set(k, [team]);
+};
+
+/**
+ * One sync outcome, as steps (a generator yields between transactions so a big directory never blocks the event loop for
+ * long). Step 1 clears members and trust and marks the copy unusable, the chunks insert rows (the gate's index is built
+ * from the same rows, once per sync, here), the last transaction writes teams and the sync row and swaps the in-memory
+ * index. A crash in between leaves `usable = 0`: the copy is unavailable (fail closed) and the next read is a full one.
+ */
+function* writeSteps(db: Db, model: FleetModel | null, state: { revision: number | null; error: string | null }, now: number): Generator<void, void, void> {
+  if (!model) {
+    db.transaction(() => {
+      if (state.error === null) db.prepare("UPDATE fleet_sync SET revision = ?, synced_at = ?, stale = 0, error = NULL, usable = 1 WHERE id = 1").run(state.revision, now);
+      else db.prepare("UPDATE fleet_sync SET error = ? WHERE id = 1").run(state.error);
+    });
+    if (state.error === null) memoryError.delete(db);
+    // an "unchanged" answer moves the read time; a transient error changes nothing the gate uses
+    const hit = fleetCache.get(db);
+    if (state.error === null) {
+      if (hit) fleetCache.set(db, { ...hit, okAt: now, usable: true });
+      else fleetCache.delete(db);
+    }
+    return;
+  }
+  db.transaction(() => {
+    db.exec("DELETE FROM fleet_members; DELETE FROM fleet_trust;");
+    db.prepare("UPDATE fleet_sync SET usable = 0, stale = 1 WHERE id = 1").run();
+  });
+  const idx = new Map<string, string[]>();
+  const idxAny = new Map<string, string[]>();
+  const trust = new Map<string, TrustEntry>();
+  const gone = new Set<string>();
+  const m = db.prepare("INSERT OR IGNORE INTO fleet_members (team_id, member_key, active) VALUES (?, ?, ?)");
+  const tr = db.prepare("INSERT OR REPLACE INTO fleet_trust (member_key, trusts, all_active) VALUES (?, ?, ?)");
+  let batch: (() => void)[] = [];
+  function* flush(force: boolean): Generator<void, void, void> {
+    if (batch.length === 0 || (!force && batch.length < FLEET_WRITE_CHUNK_ROWS)) return;
+    const rows = batch;
+    batch = [];
+    db.transaction(() => {
+      for (const run of rows) run();
+    });
+    yield;
+  }
+  for (const team of model.teams) {
+    const active = new Set(team.activeKeys);
+    for (const k of team.keys) {
+      const on = active.has(k);
+      add(idxAny, k, team.id);
+      if (on) add(idx, k, team.id);
+      batch.push(() => m.run(team.id, k, on ? 1 : 0));
+      yield* flush(false);
+    }
+  }
+  for (const [k, v] of model.trust) {
+    trust.set(k, v);
+    if (!v.allActive) gone.add(k);
+    batch.push(() => tr.run(k, [...v.trusts].sort().join(","), v.allActive ? 1 : 0));
+    yield* flush(false);
+  }
+  yield* flush(true);
+  db.transaction(() => {
+    db.exec("DELETE FROM fleet_teams;");
+    const t = db.prepare("INSERT INTO fleet_teams (id, name, people, agents) VALUES (?, ?, ?, ?)");
+    for (const team of model.teams) t.run(team.id, team.name, team.people, team.agents);
+    if (state.error === null) db.prepare("UPDATE fleet_sync SET revision = ?, synced_at = ?, stale = 0, error = NULL, usable = 1 WHERE id = 1").run(state.revision, now);
+    else db.prepare("UPDATE fleet_sync SET revision = NULL, stale = 1, error = ?, usable = 0 WHERE id = 1").run(state.error);
+  });
+  const usable = state.error === null;
+  if (usable) memoryError.delete(db);
+  fleetCache.set(db, { idx, idxAny, trust, gone, okAt: usable ? now : fleetState(db).syncedAt, usable });
+}
+
+/** Synchronous write (one go): small models, errors, tests. */
+export function writeFleet(db: Db, model: FleetModel | null, state: { revision: number | null; error: string | null }, now = Date.now()): void {
+  for (const g = writeSteps(db, model, state, now); !g.next().done; );
+}
+
+/** The write the sync uses: the same steps, yielding to the event loop between transactions. */
+export async function writeFleetChunked(
+  db: Db,
+  model: FleetModel | null,
+  state: { revision: number | null; error: string | null },
+  now = Date.now(),
+  pause: () => Promise<void> = () => new Promise((r) => setImmediate(r)),
+): Promise<void> {
+  const g = writeSteps(db, model, state, now);
+  for (let r = g.next(); !r.done; r = g.next()) await pause();
+}
+
+export const emptyFleet = (): FleetModel => ({ teams: [], trust: new Map() });
 
 export function fleetTeams(db: Db): { id: string; name: string; people: number; agents: number }[] {
   return db
@@ -375,26 +544,56 @@ export function fleetTeams(db: Db): { id: string; name: string; people: number; 
     .map((r) => ({ id: String(r.id), name: String(r.name), people: Number(r.people), agents: Number(r.agents) }));
 }
 
-/**
- * member key → team ids; cached until the next sync. Empty when no read has succeeded within FLEET_MAX_STALE_MS, so a
- * copy that can no longer be confirmed never decides (fail safe), whatever stopped the refresh.
- */
-export function fleetIndex(db: Db, now = Date.now()): Map<string, string[]> {
-  let hit = fleetCache.get(db);
-  if (!hit) {
-    hit = { idx: loadFleetIndex(db), okAt: fleetState(db).syncedAt };
-    fleetCache.set(db, hit);
-  }
-  return hit.okAt != null && now - hit.okAt <= FLEET_MAX_STALE_MS ? hit.idx : new Map();
+export interface FleetFacts {
+  /** false = never read, refused, or no successful read within FLEET_MAX_STALE_MS: the maps below are empty */
+  available: boolean;
+  /** member key → team ids, members that COUNT only (allow rules) */
+  teams: Map<string, string[]>;
+  /** member key → team ids, EVERY membership incl. blocked, departed, removed (deny and hold rules) */
+  teamsAny: Map<string, string[]>;
+  /** contact/agent key (`contact:<id>`, `handle:<h>`, `agent:<id>`) → its holders' trust set; a key that is missing is `unreviewed` */
+  trust: Map<string, TrustEntry>;
+  /** keys with at least one holder that is blocked, departed or removed */
+  gone: Set<string>;
 }
 
-function loadFleetIndex(db: Db): Map<string, string[]> {
-  const idx = new Map<string, string[]>();
-  for (const r of db.prepare("SELECT team_id, member_key FROM fleet_members").all()) {
-    const k = String(r.member_key);
-    const list = idx.get(k) ?? [];
-    list.push(String(r.team_id));
-    idx.set(k, list);
+const NONE = (): FleetFacts => ({ available: false, teams: new Map(), teamsAny: new Map(), trust: new Map(), gone: new Set() });
+
+/**
+ * The Fleet facts the gate may use; cached until the next sync (built at write time). `available` is false (and the maps
+ * empty) unless a read succeeded within FLEET_MAX_STALE_MS and no refusal cleared the copy, so a copy that can no longer be
+ * confirmed never decides, whatever stopped the refresh. The engine then treats deny/hold rules that name Fleet facts as
+ * applying and skips allow rules that name them.
+ */
+export function fleetFacts(db: Db, now = Date.now()): FleetFacts {
+  let hit = fleetCache.get(db);
+  if (!hit) {
+    const st = fleetState(db);
+    hit = { ...loadFleet(db), okAt: st.syncedAt, usable: st.usable };
+    fleetCache.set(db, hit);
   }
-  return idx;
+  const available = hit.usable && hit.okAt != null && now - hit.okAt <= FLEET_MAX_STALE_MS;
+  return available ? { available, teams: hit.idx, teamsAny: hit.idxAny, trust: hit.trust, gone: hit.gone } : NONE();
+}
+
+/** member key → team ids of members that count (empty while unavailable). */
+export function fleetIndex(db: Db, now = Date.now()): Map<string, string[]> {
+  return fleetFacts(db, now).teams;
+}
+
+function loadFleet(db: Db): Pick<FleetCacheEntry, "idx" | "idxAny" | "trust" | "gone"> {
+  const idx = new Map<string, string[]>();
+  const idxAny = new Map<string, string[]>();
+  for (const r of db.prepare("SELECT team_id, member_key, active FROM fleet_members").all()) {
+    add(idxAny, String(r.member_key), String(r.team_id));
+    if (Number(r.active) === 1) add(idx, String(r.member_key), String(r.team_id));
+  }
+  const trust = new Map<string, TrustEntry>();
+  const gone = new Set<string>();
+  for (const r of db.prepare("SELECT member_key, trusts, all_active FROM fleet_trust").all()) {
+    const k = String(r.member_key);
+    trust.set(k, { trusts: String(r.trusts).split(",") as Trust[], allActive: Number(r.all_active) === 1 });
+    if (Number(r.all_active) !== 1) gone.add(k);
+  }
+  return { idx, idxAny, trust, gone };
 }

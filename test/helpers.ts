@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type { Db, HookContext, HookRequest, Json, OpContext } from "@opt2-tealbrick/miniapp-sdk";
 import { migrationsDir } from "../src/app.ts";
-import type { RuleSpec } from "../src/engine.ts";
+import type { RuleSpec, Trust } from "../src/engine.ts";
 
 // Booted apps in unit tests never read the real release index (catalog tests use a signed fake index).
 process.env.TB_RULES_CATALOG_OFF = "1";
@@ -59,13 +59,57 @@ export function hookReq(
   } as unknown as HookRequest;
 }
 
+/** A valid fleet.directory_feed/1 answer (full): team tm_x with an agent, an active contact, a departed contact, a blocked contact and a removed agent. */
+export const NPUB = "buzz:npub180cvv07tjdrrgpa0j7j7tmnyl2yr6yr7l8j4s3evf6u64th6gkwsyjh6w6";
+export const AGENT_R = "agt_01J0000000000000000000000R";
+export function feed(over: Record<string, unknown> = {}): Record<string, Json> {
+  return {
+    v: 1,
+    revision: 7,
+    teams: [
+      {
+        id: "tm_x",
+        name: "Team X",
+        members: [
+          { kind: "agent", id: AGENT_A, role: "lead" },
+          { kind: "agent", id: AGENT_R, role: "member" },
+          { kind: "contact", id: "ct_anna", role: "member" },
+          { kind: "contact", id: "ct_gone", role: "member" },
+          { kind: "contact", id: "ct_block", role: "member" },
+        ],
+      },
+      { id: "tm_y", members: [{ kind: "agent", id: AGENT_B, role: "member" }] },
+    ],
+    contacts: [
+      { id: "ct_anna", kind: "person", status: "active", trust: "trusted", handles: ["slack:U777", NPUB] },
+      { id: "ct_gone", kind: "person", status: "departed", trust: "trusted", handles: ["telegram:9"] },
+      { id: "ct_block", kind: "outside_agent", status: "active", trust: "blocked", handles: ["slack:U666"] },
+    ],
+    agents: [
+      { id: AGENT_A, status: "active", trust: "trusted", owner: "ct_anna" },
+      { id: AGENT_B, status: "paused", trust: "unreviewed", owner: null },
+      { id: AGENT_R, status: "removed", trust: "blocked", owner: null },
+    ],
+    ...over,
+  } as Record<string, Json>;
+}
+
+/**
+ * Trust facts for a hand-built CallFacts: `claimTrust` (a single holder: a value, or null = unknown requester → unreviewed),
+ * or `claimTrusts` + `claimTrustActive` for several holders. No claim and nothing given → no trust.
+ */
+export function trustFacts(o: { claim?: unknown; claimTrust?: Trust | null; claimTrusts?: readonly Trust[]; claimTrustActive?: boolean }): { claimTrusts: readonly Trust[]; claimTrustActive: boolean } {
+  const trusts = o.claimTrusts ?? (o.claimTrust !== undefined ? [o.claimTrust ?? "unreviewed"] : o.claim ? ["unreviewed" as const] : []);
+  return { claimTrusts: trusts, claimTrustActive: o.claimTrustActive ?? true };
+}
+
 export function spec(o: Partial<RuleSpec> & { decision?: RuleSpec["outcome"]["decision"]; reason?: string }): RuleSpec {
   const { decision, reason, ...rest } = o;
   return { title: "rule", active: true, priority: 100, match: {}, outcome: { decision: decision ?? "deny", reason: reason ?? "not allowed" }, ...rest };
 }
 
 /** Minimal OpContext for handler tests (person or agent caller). */
-export function opCtx(db: Db, caller: { type: "person" | "agent"; id: string; name?: string; mode?: "free" | "bound" | null }, callApp?: OpContext["callApp"]): OpContext {
+export function opCtx(db: Db, caller: { type: "person" | "agent" | "app"; id: string; name?: string; mode?: "free" | "bound" | null }, callApp?: OpContext["callApp"]): OpContext {
   const meta: Json[] = [];
   return {
     db,

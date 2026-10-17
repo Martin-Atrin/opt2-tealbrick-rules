@@ -10,6 +10,7 @@ const DECISIONS = [
   { value: "deny", label: "Refuse" },
   { value: "hold", label: "Hold for my review" },
 ];
+const TRUSTS = ["unreviewed", "trusted", "limited", "blocked"] as const;
 const MODES = [
   { value: "free" as const, label: "Free" },
   { value: "bound" as const, label: "Bound" },
@@ -25,7 +26,7 @@ function Editor({ initial, dir, onDone }: { initial: RuleRow | null; dir: Direct
   const obo = m.onBehalfOf ?? {};
   const setObo = (patch: Partial<NonNullable<RuleSpec["match"]["onBehalfOf"]>>) => {
     const next = { ...obo, ...patch };
-    setMatch({ onBehalfOf: next.teams || next.ids || next.kinds ? next : undefined });
+    setMatch({ onBehalfOf: next.teams || next.ids || next.kinds || next.trust ? next : undefined });
   };
   const tags = s.narrowing?.memoryTags ?? {};
   const setTags = (patch: { anyOf?: string[]; noneOf?: string[] }) => {
@@ -106,10 +107,24 @@ function Editor({ initial, dir, onDone }: { initial: RuleRow | null; dir: Direct
           </Field>
         </div>
         <ChipChoice
-          label="On behalf of a member of team (from Organization Plane)"
+          label="Caller is a member of team (from Governance)"
+          hint="none = any. If Governance can’t be read, a refuse or hold rule with this applies and an allow rule with this does not."
+          options={dir.teams.map((t) => ({ value: t.id, label: t.name }))}
+          value={m.callerTeams}
+          onChange={(v) => setMatch({ callerTeams: v })}
+        />
+        <ChipChoice
+          label="On behalf of a member of team (from Governance)"
           options={dir.teams.map((t) => ({ value: t.id, label: t.name }))}
           value={obo.teams}
           onChange={(v) => setObo({ teams: v })}
+        />
+        <ChipChoice
+          label="Requester trust (from Governance)"
+          hint="none = any. Trust of the claimed requester; an unknown requester has none."
+          options={TRUSTS.map((t) => ({ value: t, label: t }))}
+          value={obo.trust}
+          onChange={(v) => setObo({ trust: v })}
         />
         <Field label="On behalf of" hint="Ids or handles such as slack:U123, comma separated. A claimed requester can only make a decision stricter, never wider.">
           <TextInput value={joinList(obo.ids)} onChange={(e) => setObo({ ids: list(e.target.value) })} />
@@ -208,6 +223,14 @@ function Preview({ candidate, dir }: { candidate?: RuleSpec; dir: Directory }) {
             {result.ruleTitle ? <span className="tb-hint">by “{result.ruleTitle}”</span> : null}
           </div>
           {result.narrowing ? <p className="tb-soft">Narrowed to memories: {JSON.stringify(result.narrowing.memoryTags)}</p> : null}
+          {result.fleetAvailable ? (
+            <p className="tb-hint">
+              Caller teams: {result.callerTeams.length ? result.callerTeams.map(dir.teamName).join(", ") : "none"} · requester teams: {result.teams.length ? result.teams.map(dir.teamName).join(", ") : "none"} ·
+              requester trust: {result.trust ?? "unknown"}
+            </p>
+          ) : (
+            <p className="tb-soft">Governance can’t be read right now, so refuse and hold rules that name teams or trust apply and allow rules that name them do not.</p>
+          )}
           {result.decision === "hold" && result.answered === "deny" ? (
             <p className="tb-soft">Holds from rules arrive with the next platform release. Until then a hold rule refuses.</p>
           ) : null}

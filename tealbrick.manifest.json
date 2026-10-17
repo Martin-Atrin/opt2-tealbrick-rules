@@ -4,7 +4,7 @@
   "id": "rules",
   "name": "Rules & Approvals",
   "summary": "Rules & Approvals is the workspace policy: it allows, refuses or holds other apps’ calls, always with a recorded reason.",
-  "version": "0.2.12",
+  "version": "0.3.0",
   "sdkMajor": 1,
   "requires": {
     "bridge": "0.1.17"
@@ -270,6 +270,15 @@
                       ]
                     }
                   },
+                  "callerTeams": {
+                    "type": "array",
+                    "maxItems": 50,
+                    "items": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 64
+                    }
+                  },
                   "onBehalfOf": {
                     "type": "object",
                     "additionalProperties": false,
@@ -301,6 +310,18 @@
                             "person",
                             "agent",
                             "channel_sender"
+                          ]
+                        }
+                      },
+                      "trust": {
+                        "type": "array",
+                        "maxItems": 4,
+                        "items": {
+                          "enum": [
+                            "unreviewed",
+                            "trusted",
+                            "limited",
+                            "blocked"
                           ]
                         }
                       }
@@ -564,6 +585,15 @@
                       ]
                     }
                   },
+                  "callerTeams": {
+                    "type": "array",
+                    "maxItems": 50,
+                    "items": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 64
+                    }
+                  },
                   "onBehalfOf": {
                     "type": "object",
                     "additionalProperties": false,
@@ -595,6 +625,18 @@
                             "person",
                             "agent",
                             "channel_sender"
+                          ]
+                        }
+                      },
+                      "trust": {
+                        "type": "array",
+                        "maxItems": 4,
+                        "items": {
+                          "enum": [
+                            "unreviewed",
+                            "trusted",
+                            "limited",
+                            "blocked"
                           ]
                         }
                       }
@@ -775,6 +817,15 @@
                       ]
                     }
                   },
+                  "callerTeams": {
+                    "type": "array",
+                    "maxItems": 50,
+                    "items": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 64
+                    }
+                  },
                   "onBehalfOf": {
                     "type": "object",
                     "additionalProperties": false,
@@ -806,6 +857,18 @@
                             "person",
                             "agent",
                             "channel_sender"
+                          ]
+                        }
+                      },
+                      "trust": {
+                        "type": "array",
+                        "maxItems": 4,
+                        "items": {
+                          "enum": [
+                            "unreviewed",
+                            "trusted",
+                            "limited",
+                            "blocked"
                           ]
                         }
                       }
@@ -1002,6 +1065,15 @@
                       ]
                     }
                   },
+                  "callerTeams": {
+                    "type": "array",
+                    "maxItems": 50,
+                    "items": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 64
+                    }
+                  },
                   "onBehalfOf": {
                     "type": "object",
                     "additionalProperties": false,
@@ -1033,6 +1105,18 @@
                             "person",
                             "agent",
                             "channel_sender"
+                          ]
+                        }
+                      },
+                      "trust": {
+                        "type": "array",
+                        "maxItems": 4,
+                        "items": {
+                          "enum": [
+                            "unreviewed",
+                            "trusted",
+                            "limited",
+                            "blocked"
                           ]
                         }
                       }
@@ -1161,7 +1245,7 @@
       "idempotency": "none",
       "id": "rules_preview",
       "title": "Preview a decision",
-      "description": "Dry run: which rule would decide this call, and why. Optionally with an unsaved rule.",
+      "description": "Dry run: which rule would decide this call, and why. Optionally with an unsaved rule. The answer names the Fleet facts used (the caller's teams, the claimed requester's teams and trust) and whether they were available; when they are not, deny and hold rules that name them apply and allow rules that name them do not.",
       "input": {
         "type": "object",
         "additionalProperties": false,
@@ -1352,6 +1436,15 @@
                       ]
                     }
                   },
+                  "callerTeams": {
+                    "type": "array",
+                    "maxItems": 50,
+                    "items": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 64
+                    }
+                  },
                   "onBehalfOf": {
                     "type": "object",
                     "additionalProperties": false,
@@ -1383,6 +1476,18 @@
                             "person",
                             "agent",
                             "channel_sender"
+                          ]
+                        }
+                      },
+                      "trust": {
+                        "type": "array",
+                        "maxItems": 4,
+                        "items": {
+                          "enum": [
+                            "unreviewed",
+                            "trusted",
+                            "limited",
+                            "blocked"
                           ]
                         }
                       }
@@ -1459,6 +1564,9 @@
           "ruleTitle",
           "narrowing",
           "teams",
+          "callerTeams",
+          "trust",
+          "fleetAvailable",
           "steps"
         ],
         "properties": {
@@ -1532,6 +1640,31 @@
             "items": {
               "type": "string"
             }
+          },
+          "callerTeams": {
+            "type": "array",
+            "maxItems": 100,
+            "items": {
+              "type": "string"
+            }
+          },
+          "trust": {
+            "anyOf": [
+              {
+                "enum": [
+                  "unreviewed",
+                  "trusted",
+                  "limited",
+                  "blocked"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "fleetAvailable": {
+            "type": "boolean"
           },
           "steps": {
             "type": "array",
@@ -1835,6 +1968,7 @@
               "note",
               "rules",
               "submittedBy",
+              "source",
               "submittedAt",
               "decidedAt",
               "decidedBy",
@@ -1881,6 +2015,33 @@
                   },
                   "name": {
                     "type": "string"
+                  }
+                }
+              },
+              "source": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "kind"
+                ],
+                "properties": {
+                  "kind": {
+                    "enum": [
+                      "agent",
+                      "app"
+                    ]
+                  },
+                  "product": {
+                    "type": "string",
+                    "maxLength": 40
+                  },
+                  "name": {
+                    "type": "string",
+                    "maxLength": 80
+                  },
+                  "instance": {
+                    "type": "string",
+                    "maxLength": 64
                   }
                 }
               },
@@ -2014,6 +2175,15 @@
                       ]
                     }
                   },
+                  "callerTeams": {
+                    "type": "array",
+                    "maxItems": 50,
+                    "items": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 64
+                    }
+                  },
                   "onBehalfOf": {
                     "type": "object",
                     "additionalProperties": false,
@@ -2045,6 +2215,18 @@
                             "person",
                             "agent",
                             "channel_sender"
+                          ]
+                        }
+                      },
+                      "trust": {
+                        "type": "array",
+                        "maxItems": 4,
+                        "items": {
+                          "enum": [
+                            "unreviewed",
+                            "trusted",
+                            "limited",
+                            "blocked"
                           ]
                         }
                       }
@@ -2165,6 +2347,7 @@
               "note",
               "rules",
               "submittedBy",
+              "source",
               "submittedAt",
               "decidedAt",
               "decidedBy",
@@ -2211,6 +2394,33 @@
                   },
                   "name": {
                     "type": "string"
+                  }
+                }
+              },
+              "source": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "kind"
+                ],
+                "properties": {
+                  "kind": {
+                    "enum": [
+                      "agent",
+                      "app"
+                    ]
+                  },
+                  "product": {
+                    "type": "string",
+                    "maxLength": 40
+                  },
+                  "name": {
+                    "type": "string",
+                    "maxLength": 80
+                  },
+                  "instance": {
+                    "type": "string",
+                    "maxLength": 64
                   }
                 }
               },
@@ -2344,6 +2554,15 @@
                       ]
                     }
                   },
+                  "callerTeams": {
+                    "type": "array",
+                    "maxItems": 50,
+                    "items": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 64
+                    }
+                  },
                   "onBehalfOf": {
                     "type": "object",
                     "additionalProperties": false,
@@ -2375,6 +2594,18 @@
                             "person",
                             "agent",
                             "channel_sender"
+                          ]
+                        }
+                      },
+                      "trust": {
+                        "type": "array",
+                        "maxItems": 4,
+                        "items": {
+                          "enum": [
+                            "unreviewed",
+                            "trusted",
+                            "limited",
+                            "blocked"
                           ]
                         }
                       }
@@ -2450,8 +2681,8 @@
       "effect": "read",
       "idempotency": "none",
       "id": "fleet_status",
-      "title": "Teams from Organization Plane",
-      "description": "The replicated Organization Plane teams that rules can name, and when they were last read.",
+      "title": "Teams from Governance",
+      "description": "The replicated Governance teams and contact trust that rules can name, when they were last read, and whether Rules can rely on them now.",
       "input": {
         "type": "object",
         "additionalProperties": false,
@@ -2470,7 +2701,8 @@
           "revision",
           "syncedAt",
           "error",
-          "teams"
+          "teams",
+          "available"
         ],
         "properties": {
           "source": {
@@ -2524,6 +2756,9 @@
                 }
               }
             }
+          },
+          "available": {
+            "type": "boolean"
           }
         }
       }
@@ -2571,7 +2806,8 @@
                 "answered",
                 "reason",
                 "ruleId",
-                "ruleTitle"
+                "ruleTitle",
+                "fleetUnavailable"
               ],
               "properties": {
                 "callId": {
@@ -2619,6 +2855,9 @@
                     "string",
                     "null"
                   ]
+                },
+                "fleetUnavailable": {
+                  "type": "boolean"
                 }
               }
             }
@@ -2752,6 +2991,15 @@
                       ]
                     }
                   },
+                  "callerTeams": {
+                    "type": "array",
+                    "maxItems": 50,
+                    "items": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 64
+                    }
+                  },
                   "onBehalfOf": {
                     "type": "object",
                     "additionalProperties": false,
@@ -2783,6 +3031,18 @@
                             "person",
                             "agent",
                             "channel_sender"
+                          ]
+                        }
+                      },
+                      "trust": {
+                        "type": "array",
+                        "maxItems": 4,
+                        "items": {
+                          "enum": [
+                            "unreviewed",
+                            "trusted",
+                            "limited",
+                            "blocked"
                           ]
                         }
                       }
@@ -2871,6 +3131,69 @@
       "idempotency": "required",
       "receipt": true,
       "audience": "agent"
+    },
+    {
+      "id": "draft_status",
+      "title": "Status of a rule draft",
+      "description": "The state of a rule draft you submitted: pending, approved or rejected. It answers only for drafts the caller itself submitted; any other draft id answers not_found, the same as an id that does not exist.",
+      "input": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "draftId"
+        ],
+        "properties": {
+          "draftId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64
+          }
+        }
+      },
+      "output": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "draftId",
+          "status",
+          "submittedAt",
+          "decidedAt",
+          "ruleCount"
+        ],
+        "properties": {
+          "draftId": {
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "pending",
+              "approved",
+              "rejected"
+            ]
+          },
+          "submittedAt": {
+            "type": "string"
+          },
+          "decidedAt": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ruleCount": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 10
+          }
+        }
+      },
+      "crud": [
+        "read"
+      ],
+      "effect": "read",
+      "idempotency": "none",
+      "receipt": false,
+      "audience": "agent"
     }
   ],
   "hooks": [
@@ -2918,12 +3241,12 @@
     {
       "product": "fleet",
       "operations": [
-        "directory_get"
+        "directory_feed"
       ],
       "crud": [
         "read"
       ],
-      "purpose": "Reads Organization Plane teams, people and agents so rules can name teams (refreshed outside calls)."
+      "purpose": "Reads the Governance directory feed (teams, contact trust and handles, agents) so rules can name teams and trust (refreshed outside calls)."
     }
   ],
   "needsAgentDirectory": true,

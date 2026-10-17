@@ -4,8 +4,8 @@
 import { performance } from "node:perf_hooks";
 import { hookResponseProblem } from "@opt2-tealbrick/manifest";
 import type { Db, HookContext, HookHandler, HookRequest, Json } from "@opt2-tealbrick/miniapp-sdk";
-import { type CallFacts, type Claim, claimKey, evaluate, recorded, redactionsFor, type Verdict } from "./engine.ts";
-import { fleetIndex, liveRules, recordDecision } from "./store.ts";
+import { type CallFacts, type Claim, claimKey, evaluate, mergeNarrowing, type Narrowing, recorded, redactionsFor, strictestNarrowing, type Verdict } from "./engine.ts";
+import { type FleetFacts, fleetFacts, liveRules, recordDecision } from "./store.ts";
 
 /** Rules' own answer budget, far below the bridge's 2 s hook limit: slower → refuse. */
 export const GATE_BUDGET_MS = 250;
@@ -30,25 +30,78 @@ export function claimOf(context: Record<string, unknown>): { claim: Claim | null
   return { claim: { kind, id }, verified: o.verified === true };
 }
 
-/** Facts for one hook call: caller, target, claim, and the claim's teams (local Fleet copy + live Fleet context facts). */
-export function factsOf(req: HookRequest, db: Db): CallFacts {
+/**
+ * What the Fleet read model says about the claimed requester. Two team sets: `claimTeamsAny` = every membership (deny/hold
+ * rules), `claimTeams` = memberships that count (allow rules). Live facts of Governance's context hook add teams to the
+ * `Any` set always, and to the allow set only when the read model does not know the requester to be gone: the key has a
+ * blocked/departed/removed holder, or it is a member somewhere but counts nowhere (a member the producer left out). Trust is
+ * the holders' trust SET and whether all are active; a requester the directory does not know is `unreviewed` and active.
+ */
+export function claimFleetFacts(fx: FleetFacts, claim: Claim | null, live: readonly string[] = []): Pick<CallFacts, "claimTeams" | "claimTeamsAny" | "claimTrusts" | "claimTrustActive"> {
+  if (!claim) return { claimTeams: [], claimTeamsAny: [], claimTrusts: [], claimTrustActive: true };
+  const key = claimKey(claim);
+  const teams = new Set<string>(key ? (fx.teams.get(key) ?? []) : []);
+  const teamsAny = new Set<string>(key ? (fx.teamsAny.get(key) ?? []) : []);
+  const knownGone = key !== null && (fx.gone.has(key) || (fx.teamsAny.has(key) && !fx.teams.has(key)));
+  for (const t of live) {
+    teamsAny.add(t);
+    if (!knownGone) teams.add(t);
+  }
+  const entry = key ? fx.trust.get(key) : undefined;
+  return {
+    claimTeams: [...teams],
+    claimTeamsAny: [...teamsAny],
+    claimTrusts: fx.available ? (entry?.trusts ?? ["unreviewed"]) : [],
+    claimTrustActive: entry?.allActive ?? true,
+  };
+}
+
+/** Facts for one hook call: caller (and its teams), target, claim, and the claim's teams and trust (see `claimFleetFacts`). */
+export function factsOf(req: HookRequest, db: Db, now = Date.now()): CallFacts {
   const ctx = (req.context ?? {}) as Record<string, unknown>;
   const { claim, verified } = claimOf(ctx);
-  const teams = new Set<string>();
-  if (claim) {
-    for (const t of fleetIndex(db).get(claimKey(claim)) ?? []) teams.add(t);
-    // Fleet's context hook (order -100) runs before ours in the context phase; its live facts can only add teams,
-    // and team rules can only narrow, so a union never widens.
-    const live = ctx["fleet.requesterTeams"];
-    if (Array.isArray(live)) for (const t of live) if (isObj(t) && typeof t.id === "string") teams.add(t.id);
-  }
+  const fx = fleetFacts(db, now);
+  const liveRaw = ctx["fleet.requesterTeams"];
+  const live = Array.isArray(liveRaw) ? liveRaw.flatMap((t) => (isObj(t) && typeof t.id === "string" ? [t.id] : [])) : [];
+  const callerKey = req.call.caller.type === "agent" ? `agent:${req.call.caller.id}` : null;
   return {
     caller: { type: req.call.caller.type, id: req.call.caller.id, mode: req.call.caller.mode ?? null },
     target: { product: req.call.target.product, op: req.call.target.op, effect: req.call.target.effect },
     claim,
     claimVerified: verified,
-    claimTeams: [...teams],
+    ...claimFleetFacts(fx, claim, live),
+    callerTeams: callerKey ? (fx.teams.get(callerKey) ?? []) : [],
+    callerTeamsAny: callerKey ? (fx.teamsAny.get(callerKey) ?? []) : [],
+    fleetAvailable: fx.available,
   };
+}
+
+// ── pinned verdicts: the before phase decides, the after phase redacts by THAT narrowing ────────────────────
+/** A pin lives at least the after hook's timeout plus the op timeout plus 60 s. */
+export const PIN_TTL_MS = 2_000 + 30_000 + 60_000;
+/** At most this many pins per database (oldest first out); an evicted or expired pin means "missing" (fail closed). */
+export const PIN_MAX = 20_000;
+const pins = new WeakMap<Db, Map<string, { narrowing: Narrowing | null; exp: number }>>();
+
+export function pinVerdict(db: Db, callId: string, narrowing: Narrowing | null, now = Date.now()): void {
+  let m = pins.get(db);
+  if (!m) {
+    m = new Map();
+    pins.set(db, m);
+  }
+  m.delete(callId);
+  // insertion order = expiry order (one TTL), so expired pins are at the front
+  for (const [k, v] of m) {
+    if (v.exp > now && m.size < PIN_MAX) break;
+    m.delete(k);
+  }
+  m.set(callId, { narrowing, exp: now + PIN_TTL_MS });
+}
+
+/** The pinned narrowing of a call: `undefined` = no pin (never pinned, expired, evicted, or the app restarted). */
+export function pinnedNarrowing(db: Db, callId: string, now = Date.now()): Narrowing | null | undefined {
+  const p = pins.get(db)?.get(callId);
+  return p && p.exp > now ? p.narrowing : undefined;
 }
 
 /**
@@ -86,7 +139,10 @@ export function makeHooks(product: string, opts: { budgetMs?: number; holdSuppor
       const v = evaluate(liveRules(ctx.db), facts);
       const { answer, answered } = gateAnswer(v, opts.holdSupported ?? HOLD_SUPPORTED);
       if (ctx.signal.aborted || clock() - t0 > budget) throw new Error("gate budget exceeded");
-      if (recorded(facts, v)) recordDecision(ctx.db, { callId: req.call.id, phase: "before", facts, decision: v.decision, answered, reason: v.reason, rule: v.rule, durationUs: elapsedUs(t0) });
+      // The after hook redacts by the narrowing decided HERE (read calls only: that is where rules_filter runs).
+      if (v.decision === "allow" && facts.target.effect === "read") pinVerdict(ctx.db, req.call.id, v.narrowing);
+      if (recorded(facts, v))
+        recordDecision(ctx.db, { callId: req.call.id, phase: "before", facts, decision: v.decision, answered, reason: v.reason, rule: v.rule, ...(v.closedOnFleet ? { detail: { fleetUnavailable: true } } : {}), durationUs: elapsedUs(t0) });
       return answer;
     } catch (e) {
       ctx.log.warn("rules_gate refused (fail closed)", { error: e instanceof Error ? e.message : "unknown", call: req.call.id });
@@ -101,8 +157,11 @@ export function makeHooks(product: string, opts: { budgetMs?: number; holdSuppor
     const add: Record<string, Json> = {};
     if (v.rule) add[`${product}.matched`] = { v: 1, ruleId: v.rule.id, rev: v.rule.rev, decision: v.decision };
     if (facts.claim) add[`${product}.onBehalfOf`] = { claim: { ...facts.claim }, verified: facts.claimVerified, teams: [...facts.claimTeams] };
-    if (v.decision === "allow" && v.narrowing?.memoryTags && v.rule) {
-      add[`${product}.narrowing`] = { v: 1, ruleId: v.rule.id, reason: clamp(v.reason), memoryTags: v.narrowing.memoryTags as Json };
+    const narrowingRuleId = v.narrowingRuleId;
+    if (v.decision === "allow" && v.narrowing?.memoryTags && narrowingRuleId) {
+      // the reason belongs to the rule that decided; a narrowing that comes from another (skipped) rule says so
+      const reason = v.rule && v.rule.id === narrowingRuleId ? v.reason : "Governance data unavailable: the narrowing of an allow rule applies";
+      add[`${product}.narrowing`] = { v: 1, ruleId: narrowingRuleId, reason: clamp(reason), memoryTags: v.narrowing.memoryTags as Json };
       recordDecision(ctx.db, { callId: req.call.id, phase: "context", facts, decision: v.decision, answered: "narrow", reason: v.reason, rule: v.rule, detail: { narrowing: v.narrowing as Record<string, unknown> }, durationUs: elapsedUs(t0) });
     }
     if (clock() - t0 > budget) throw new Error("context budget exceeded");
@@ -113,11 +172,26 @@ export function makeHooks(product: string, opts: { budgetMs?: number; holdSuppor
     if (req.phase !== "after") return {};
     const t0 = clock();
     const facts = factsOf(req, ctx.db);
-    const v = evaluate(liveRules(ctx.db), facts);
-    if (v.decision !== "allow" || !v.narrowing) return {};
-    const redactions = redactionsFor(req.output, v.narrowing);
+    const rules = liveRules(ctx.db);
+    const v = evaluate(rules, facts);
+    // The before phase's verdict, kept per call. No pin (restart, expiry, eviction): the strictest narrowing that could
+    // apply, together with the current verdict's (fail closed).
+    const pin = pinnedNarrowing(ctx.db, req.call.id);
+    const narrowing = pin !== undefined ? pin : mergeNarrowing(v.decision === "allow" ? v.narrowing : null, strictestNarrowing(rules, facts));
+    if (!narrowing) return {};
+    const redactions = redactionsFor(req.output, narrowing);
     if (redactions.length === 0) return {};
-    recordDecision(ctx.db, { callId: req.call.id, phase: "after", facts, decision: v.decision, answered: "redact", reason: v.reason, rule: v.rule, detail: { redacted: redactions.length }, durationUs: elapsedUs(t0) });
+    recordDecision(ctx.db, {
+      callId: req.call.id,
+      phase: "after",
+      facts,
+      decision: "allow",
+      answered: "redact",
+      reason: v.reason,
+      rule: v.rule,
+      detail: { redacted: redactions.length, ...(pin === undefined ? { pinMissing: true } : {}) },
+      durationUs: elapsedUs(t0),
+    });
     return { redactions };
   }
 

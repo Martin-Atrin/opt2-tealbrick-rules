@@ -1,4 +1,4 @@
-// Teams page: Rules keeps a copy of the owner’s Organization Plane teams (fleet_status) so a rule can name a team.
+// Teams page: Rules keeps a copy of the owner’s Governance teams (fleet_status) so a rule can name a team.
 import { Button, EmptyState, Notice, Swatch, Tag } from "@opt2-tealbrick/ui";
 import { useCallback, useEffect, useState } from "react";
 import { errorText, type Out, run, when } from "./api.ts";
@@ -22,12 +22,12 @@ export function TeamsPage() {
   return (
     <section className="app-page" aria-label="Teams">
       <Head title="Teams" />
-      <p className="tb-soft rules-intro">Rules keeps a copy of your Organization Plane teams so a rule can name a team without asking during a call.</p>
+      <p className="tb-soft rules-intro">Rules keeps a copy of your Governance teams and contact trust so a rule can name a team or a trust level without asking during a call.</p>
       {error ? <LoadError message={error} retrying={loading} onRetry={() => load(false)} /> : null}
       {st ? (
         <>
           <div className="tb-row">
-            <Tag status={st.source === "fleet" ? "live" : "default"}>{st.source === "fleet" ? "Organization Plane connected" : "No Organization Plane"}</Tag>
+            <Tag status={st.available ? "live" : st.source === "fleet" ? "needs-you" : "default"}>{st.available ? "Governance connected" : st.source === "fleet" ? "Governance not readable" : "No Governance"}</Tag>
             <span className="tb-hint">
               last successful read {when(st.syncedAt)}
               {st.revision != null ? ` · revision ${st.revision}` : ""}
@@ -38,12 +38,12 @@ export function TeamsPage() {
           </div>
           {st.error ? (
             <Notice tone="needs-you" role="alert">
-              {st.error}. When Organization Plane refuses, Rules clears its team copy at once (team rules match nobody). After a temporary failure it keeps the last teams for at most 10
-              minutes. It retries every minute.
+              {st.error}. When Governance refuses or its answer is invalid, Rules clears its copy at once. After a temporary failure it keeps the last copy for at most 10 minutes. It retries
+              every minute. While the copy is not available, refuse and hold rules that name teams or trust apply, and allow rules that name them do not.
             </Notice>
           ) : null}
           {st.teams.length === 0 ? (
-            <EmptyState title="No teams">Deploy Organization Plane and add teams there. Team rules match nobody until then.</EmptyState>
+            <EmptyState title="No teams">Deploy Governance and add teams there. Until Rules can read it, refuse and hold rules that name teams or trust apply and allow rules that name them do not.</EmptyState>
           ) : (
             <div className="ruled">
               {st.teams.map((t) => (

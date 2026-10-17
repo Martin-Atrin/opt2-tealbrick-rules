@@ -80,15 +80,21 @@ export interface Directory {
   teamName: (id: string) => string;
   /** plain messages of what could not be loaded (RUL-14); names fall back to ids meanwhile */
   errors: readonly string[];
+  /** false = Rules cannot rely on its Governance copy (C236); null = not known (still loading, or fleet_status failed) */
+  fleetAvailable: boolean | null;
   loading: boolean;
   reload: () => void;
 }
+
+/** The exact wording the Lead asked for (C236). */
+export const FLEET_UNAVAILABLE_TEXT = "Governance data unavailable — team rules apply strictly";
 
 /** Agents (`tb.agents_list`) and Fleet teams (`fleet_status`), each with its own load error kept. */
 export function useDirectory(): Directory {
   const [agents, setAgents] = useState<readonly Agent[]>([]);
   const [teams, setTeams] = useState<readonly Team[]>([]);
   const [errors, setErrors] = useState<readonly string[]>([]);
+  const [fleetAvailable, setFleetAvailable] = useState<boolean | null>(null);
   const [loading, setLoading] = useState(true);
   const seq = useRef(0);
   const reload = useCallback(() => {
@@ -99,8 +105,13 @@ export function useDirectory(): Directory {
       const errs: string[] = [];
       if (a.status === "fulfilled") setAgents(a.value.agents);
       else errs.push(`Couldn’t load your agents, so their names show as ids. ${errorText(a.reason)}`);
-      if (t.status === "fulfilled") setTeams(t.value.teams);
-      else errs.push(`Couldn’t load your Organization Plane teams, so their names show as ids. ${errorText(t.reason)}`);
+      if (t.status === "fulfilled") {
+        setTeams(t.value.teams);
+        setFleetAvailable(t.value.available);
+      } else {
+        setFleetAvailable(null);
+      }
+      if (t.status !== "fulfilled") errs.push(`Couldn’t load your Governance teams, so their names show as ids. ${errorText(t.reason)}`);
       setErrors(errs);
       setLoading(false);
     });
@@ -108,13 +119,17 @@ export function useDirectory(): Directory {
   useEffect(reload, [reload]);
   const agentName = useCallback((id: string) => agents.find((a) => a.id === id)?.name ?? id, [agents]);
   const teamName = useCallback((id: string) => teams.find((t) => t.id === id)?.name ?? id, [teams]);
-  return { agents, teams, agentName, teamName, errors, loading, reload };
+  return { agents, teams, agentName, teamName, errors, fleetAvailable, loading, reload };
 }
 
 /** Why the directory is incomplete, with Try again. */
 export function DirectoryErrors({ dir }: { dir: Directory }) {
-  if (dir.errors.length === 0) return null;
-  return <LoadError message={dir.errors.join(" ")} retrying={dir.loading} onRetry={dir.reload} />;
+  return (
+    <>
+      {dir.fleetAvailable === false ? <Notice tone="needs-you">{FLEET_UNAVAILABLE_TEXT}</Notice> : null}
+      {dir.errors.length === 0 ? null : <LoadError message={dir.errors.join(" ")} retrying={dir.loading} onRetry={dir.reload} />}
+    </>
+  );
 }
 
 /**

@@ -10,9 +10,9 @@ import { manifestDigest, validateManifest } from "@opt2-tealbrick/manifest";
 import { defineApp, type OpContext, startApp } from "@opt2-tealbrick/miniapp-sdk";
 import { MANIFEST_DIGEST, OP } from "#kit";
 import { definition, handlers, manifest } from "../src/app.ts";
-import { parseDirectory, syncFleet } from "../src/fleet.ts";
+import { parseFeed, syncFleet } from "../src/fleet.ts";
 import { fleetIndex, fleetState, fleetTeams, liveRules, recordDecision } from "../src/store.ts";
-import { AGENT_A, AGENT_B, migratedDb, OWNER, opCtx, spec } from "./helpers.ts";
+import { AGENT_A, AGENT_B, feed, migratedDb, NPUB, OWNER, opCtx, spec } from "./helpers.ts";
 
 type Run = (input: unknown, ctx: OpContext) => Promise<any>;
 const run = (id: keyof typeof handlers) => (handlers[id] as unknown as { run: Run }).run;
@@ -36,7 +36,7 @@ test("manifest validates; hooks gate every product within the time limits", () =
   assert.deepEqual(byId.rules_gate.match, { products: ["*"] });
   assert.ok((byId.rules_gate.timeoutMs ?? 2000) <= 1000, "gate answers well under 2 s");
   assert.deepEqual(byId.rules_filter.match.effects, ["read"]);
-  assert.deepEqual(manifest.companions?.map((c) => [c.product, c.operations]), [["fleet", ["directory_get"]]]);
+  assert.deepEqual(manifest.companions?.map((c) => [c.product, c.operations]), [["fleet", ["directory_feed"]]]);
 });
 
 test("the generated kit matches the manifest and every operation and hook has exactly one handler", () => {
@@ -46,7 +46,7 @@ test("the generated kit matches the manifest and every operation and hook has ex
   assert.deepEqual(Object.keys(handlers).sort(), ids);
   assert.deepEqual(Object.keys(definition.hooks ?? {}).sort(), (manifest.hooks ?? []).map((h) => h.id).sort());
   const agentOps = manifest.operations.filter((o) => o.audience === "agent").map((o) => o.id);
-  assert.deepEqual(agentOps.sort(), ["rule_draft_submit", "rules_explain"], "rule editing is person-only");
+  assert.deepEqual(agentOps.sort(), ["draft_status", "rule_draft_submit", "rules_explain"], "rule editing is person-only");
 });
 
 test("boots on the SDK and serves the derived routes", async (t) => {
@@ -135,7 +135,7 @@ test("preview: dry run with an unsaved candidate and per-rule steps", async () =
 
 test("rules_explain: an agent sees only its own calls' decisions", async () => {
   const { db } = migratedDb();
-  const f = (caller: string) => ({ caller: { type: "agent", id: caller, mode: "free" }, target: { product: "connect", op: "buzz_dm", effect: "outward" }, claim: null, claimVerified: false, claimTeams: [] });
+  const f = (caller: string) => ({ caller: { type: "agent", id: caller, mode: "free" }, target: { product: "connect", op: "buzz_dm", effect: "outward" }, claim: null, claimVerified: false, claimTeams: [], claimTeamsAny: [], callerTeams: [], callerTeamsAny: [], claimTrusts: [], claimTrustActive: true, fleetAvailable: true });
   recordDecision(db, { callId: "cal_a", phase: "before", facts: f(AGENT_A), decision: "deny", answered: "deny", reason: "no", rule: { id: "rul_1", rev: 1, title: "t" }, durationUs: 10 });
   recordDecision(db, { callId: "cal_b", phase: "before", facts: f(AGENT_B), decision: "allow", answered: "allow", reason: "ok", rule: null, durationUs: 10 });
   const mine = await run(OP.rulesExplain)({}, opCtx(db, { type: "agent", id: AGENT_A }));
@@ -148,27 +148,12 @@ test("rules_explain: an agent sees only its own calls' decisions", async () => {
   assert.equal(all.items.length, 2);
 });
 
-const DIRECTORY = {
-  revision: 7,
-  unchanged: false,
-  teams: [
-    {
-      id: "tm_x",
-      name: "Team X",
-      members: [
-        { kind: "person", id: "psn_1", name: "P1", role: "member", handles: ["slack:u777", "npub1ABC"] },
-        { kind: "person", id: "psn_2", name: "P2", role: "member", handles: ["telegram:9"] },
-        { kind: "agent", id: AGENT_A, name: "A", role: "lead" },
-      ],
-    },
-  ],
-  people: [{ id: "psn_2", status: "departed", handles: ["telegram:9"] }],
-  agents: [],
-};
+const DIRECTORY = feed({ revision: 7 });
 
-test("Fleet read model: parse, departed people dropped, unchanged keeps, absent Fleet empties, transient error keeps", async () => {
-  const d = parseDirectory(DIRECTORY);
-  assert.deepEqual(d.teams[0]?.keys.sort(), [`agent:${AGENT_A}`, "handle:buzz:npub1abc", "handle:slack:U777", "person:psn_1"].sort());
+test("Fleet read model: parse, departed contacts dropped, unchanged keeps, refusal empties, transient error keeps", async () => {
+  const d = parseFeed(DIRECTORY);
+  assert.equal(d.model.teams[0]?.keys.length, 9, "every member, incl. removed, departed and blocked (deny/hold rules)");
+  assert.deepEqual(d.model.teams[0]?.activeKeys.sort(), [`agent:${AGENT_A}`, "contact:ct_anna", "handle:slack:U777", `handle:${NPUB}`].sort());
   const { db } = migratedDb();
   let answer: unknown = DIRECTORY;
   let fail: string | null = null;
@@ -179,22 +164,24 @@ test("Fleet read model: parse, departed people dropped, unchanged keeps, absent 
     return { status: "ok" as const, output: answer };
   };
   await syncFleet(db, callApp);
-  assert.deepEqual(fleetTeams(db), [{ id: "tm_x", name: "Team X", people: 2, agents: 1 }]);
+  assert.deepEqual(inputs[0], {}, "first read is a full one");
+  assert.deepEqual(fleetTeams(db).map((t) => t.id), ["tm_x", "tm_y"]);
   assert.deepEqual(fleetIndex(db).get("handle:slack:U777"), ["tm_x"]);
-  answer = { revision: 7, unchanged: true, teams: [], people: [], agents: [] };
+  answer = { v: 1, revision: 7, unchanged: true };
   await syncFleet(db, callApp);
   assert.deepEqual(inputs.at(-1), { sinceRevision: 7 });
-  assert.equal(fleetTeams(db).length, 1, "unchanged keeps the copy");
+  assert.equal(fleetTeams(db).length, 2, "unchanged keeps the copy");
   fail = "bridge_unavailable";
   await syncFleet(db, callApp);
-  assert.equal(fleetTeams(db).length, 1, "a transient error keeps the last copy");
+  assert.equal(fleetTeams(db).length, 2, "a transient error keeps the last copy");
   assert.match(String(fleetState(db).error), /bridge_unavailable/);
   fail = "not_granted";
   await syncFleet(db, callApp);
-  assert.equal(fleetTeams(db).length, 0, "no Fleet → teams are empty");
+  assert.equal(fleetTeams(db).length, 0, "no Governance → teams are empty");
   const st = await run(OP.fleetStatus)({}, opCtx(db, { type: "person", id: OWNER }, callApp as unknown as OpContext["callApp"]));
   assert.equal(st.source, "none");
-  assert.match(st.error, /^Fleet not reachable: not_granted/);
+  assert.equal(st.available, false);
+  assert.match(st.error, /^Governance not reachable: not_granted/);
 });
 
 test("background: onStart runs the Fleet read model with the app-initiated callApp (C85); agentsChanged refreshes; pending drafts count", async () => {
