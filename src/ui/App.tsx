@@ -1,5 +1,5 @@
 // The Rules UI inside the ONE app shell, <AppShell> from @opt2-tealbrick/ui (SDK-API §14): rules, drafts from English,
-// decision traces and Organization Plane teams, plus the standard Holds and Agents & scopes pages (./standard.tsx).
+// decision traces and Governance teams, plus the standard Holds and Agents & scopes pages (./standard.tsx).
 import { useSession } from "@opt2-tealbrick/miniapp-sdk/client";
 import { AppShell, appArt, appColour, Button, Notice, STANDARD_PAGES, Tag } from "@opt2-tealbrick/ui";
 import { useCallback, useEffect, useState } from "react";

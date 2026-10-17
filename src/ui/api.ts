@@ -67,10 +67,12 @@ export function matchText(s: RuleSpec, teamName: (id: string) => string, agentNa
   if (m.products?.length) parts.push(`apps ${m.products.join(", ")}`);
   if (m.operations?.length) parts.push(`operations ${m.operations.map((op) => opLabel(op, m.products ?? [], titles)).join(", ")}`);
   if (m.effects?.length) parts.push(`effects ${m.effects.join(", ")}`);
+  if (m.callerTeams?.length) parts.push(`caller in team ${m.callerTeams.map(teamName).join(", ")}`);
   const o = m.onBehalfOf;
   if (o?.teams?.length) parts.push(`on behalf of team ${o.teams.map(teamName).join(", ")}`);
   if (o?.ids?.length) parts.push(`on behalf of ${o.ids.join(", ")}`);
   if (o?.kinds?.length) parts.push(`requester kind ${o.kinds.join(", ")}`);
+  if (o?.trust?.length) parts.push(`requester trust ${o.trust.join(", ")}`);
   return parts.length ? parts.join("; ") : "every call";
 }
 

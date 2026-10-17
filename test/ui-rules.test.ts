@@ -36,6 +36,7 @@ const draft = (id: string, text: string, problems: (string | null)[]) => ({
   note: "",
   rules: problems.map((_, i) => spec(`Rule ${i + 1}`, "deny")),
   submittedBy: { type: "agent", id: "agt_1", name: "Front desk" },
+  source: { kind: "agent" },
   submittedAt: "2026-10-13T09:00:00.000Z",
   decidedAt: null,
   decidedBy: null,
@@ -56,7 +57,7 @@ const stub: Stub = { calls: [], fail: {}, gate: {} };
 const json = (status: number, body: unknown) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
 const OUTPUTS: Record<string, unknown> = {
   "tb.agents_list": { agents: [{ id: "agt_1", name: "Front desk", mode: "free", status: "active", access: [] }] },
-  fleet_status: { source: "none", revision: null, syncedAt: null, error: null, teams: [] },
+  fleet_status: { source: "fleet", available: true, revision: 3, syncedAt: "2026-10-17T09:00:00.000Z", error: null, teams: [{ id: "tm_x", name: "Team X", people: 1, agents: 1 }] },
   drafts_list: { drafts: [GOOD, BAD] },
   rules_list: { rules: [RULE], holdSupported: true, defaultDecision: "allow", catalog: { generatedAt: null, syncedAt: null, error: null, products: 1 } },
   draft_decide: { draft: GOOD },
@@ -221,7 +222,7 @@ describe("Rules page", () => {
     const m = await mount(h(rules.RulesPage));
     const all = alerts(m.host).join(" | ");
     assert.match(all, /Something went wrong/);
-    assert.match(all, /Couldn’t load your Organization Plane teams/);
+    assert.match(all, /Couldn’t load your Governance teams/);
     assert.equal(m.host.querySelector(".tb-empty"), null);
     stub.fail = {};
     await click(button(m.host, "Try again", 0));
@@ -275,5 +276,69 @@ describe("Teams and Decisions pages", () => {
     assert.match(alerts(d.host)[0] ?? "", /Something went wrong/);
     assert.equal(d.host.querySelector(".tb-empty"), null);
     await d.unmount();
+  });
+});
+
+const FLEET_OK = OUTPUTS.fleet_status;
+const NOTICE = "Governance data unavailable — team rules apply strictly";
+const textOf = (host: Element) => host.textContent ?? "";
+
+describe("C236 / G-3: Governance data unavailable", () => {
+  it("fire-on-bad: the Rules, Drafts and Teams pages show the exact notice while Rules cannot read Governance", async () => {
+    reset();
+    OUTPUTS.fleet_status = { source: "none", available: false, revision: null, syncedAt: null, error: "Governance not reachable: no_grant: no grant", teams: [] };
+    for (const [name, el] of [
+      ["rules", h(rules.RulesPage)],
+      ["drafts", h(drafts.DraftsPage, { onChange: () => {} })],
+    ] as const) {
+      const m = await mount(el);
+      assert.ok(textOf(m.host).includes(NOTICE), `${name}: notice shown`);
+      assert.equal([...m.host.querySelectorAll(".tb-notice")].filter((n) => n.textContent === NOTICE).length, 1, "exactly once");
+      await m.unmount();
+    }
+    const t = await mount(h(teams.TeamsPage));
+    assert.match(textOf(t.host), /Governance not readable|No Governance/);
+    assert.match(textOf(t.host), /allow rules that name them do not/);
+    await t.unmount();
+    OUTPUTS.fleet_status = FLEET_OK;
+  });
+
+  it("quiet-on-good: no notice when Governance is available, nor while the status itself failed to load", async () => {
+    reset();
+    const m = await mount(h(rules.RulesPage));
+    assert.ok(!textOf(m.host).includes(NOTICE));
+    await m.unmount();
+    stub.fail.fleet_status = { status: 500, code: "internal_error" };
+    const m2 = await mount(h(rules.RulesPage));
+    assert.ok(!textOf(m2.host).includes(NOTICE), "unknown is not 'unavailable'");
+    await m2.unmount();
+  });
+});
+
+describe("G-3: match fields and who proposed a draft", () => {
+  it("the Drafts page says 'proposed by <app>' for an app, 'from <agent>' for an agent", async () => {
+    reset();
+    const byApp = { ...draft("drf_app", "Hold sends for team X.", [null]), source: { kind: "app", product: "fleet", name: "Governance", instance: "ins_1" }, submittedBy: { type: "app", id: "ins_1", name: "Governance" } };
+    const saved = OUTPUTS.drafts_list;
+    OUTPUTS.drafts_list = { drafts: [byApp, GOOD] };
+    const m = await mount(h(drafts.DraftsPage, { onChange: () => {} }));
+    const [app, agent] = cards(m.host) as [Element, Element];
+    assert.match(textOf(app), /proposed by Governance/);
+    assert.doesNotMatch(textOf(agent), /proposed by/);
+    assert.match(textOf(agent), /from Front desk/);
+    await m.unmount();
+    OUTPUTS.drafts_list = saved;
+  });
+
+  it("a rule list line names caller teams and requester trust", async () => {
+    reset();
+    const r = { ...RULE, spec: { ...spec("Team X holds", "hold"), match: { callerTeams: ["tm_x"], onBehalfOf: { trust: ["unreviewed", "blocked"] } } } };
+    const saved = OUTPUTS.rules_list;
+    OUTPUTS.rules_list = { ...(saved as object), rules: [r] };
+    const m = await mount(h(rules.RulesPage));
+    assert.match(textOf(m.host), /caller in team Team X/);
+    assert.match(textOf(m.host), /requester trust unreviewed, blocked/);
+    await m.unmount();
+    OUTPUTS.rules_list = saved;
   });
 });
